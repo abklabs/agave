@@ -45,6 +45,7 @@ use {
     rand::{seq::SliceRandom, thread_rng, CryptoRng, Rng},
     rayon::{prelude::*, ThreadPool, ThreadPoolBuilder},
     serde::ser::Serialize,
+    solana_feature_set::FeatureSet,
     solana_ledger::shred::Shred,
     solana_measure::measure::Measure,
     solana_net_utils::{
@@ -62,7 +63,6 @@ use {
     solana_sanitize::{Sanitize, SanitizeError},
     solana_sdk::{
         clock::{Slot, DEFAULT_MS_PER_SLOT, DEFAULT_SLOTS_PER_EPOCH},
-        feature_set::FeatureSet,
         hash::Hash,
         pubkey::Pubkey,
         quic::QUIC_PORT_OFFSET,
@@ -311,7 +311,7 @@ pub(crate) type Ping = ping_pong::Ping<[u8; GOSSIP_PING_TOKEN_SIZE]>;
 #[cfg_attr(
     feature = "frozen-abi",
     derive(AbiExample, AbiEnumVisitor),
-    frozen_abi(digest = "6YaMJand6tKtNLUrqvusC5QVDmVLCWYRg5LtxYNi6XN4")
+    frozen_abi(digest = "GfVFxfPfYcFLCaa29uxQxyKJAuTZ1cYqcRKhVrEKwDK7")
 )]
 #[derive(Serialize, Deserialize, Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -419,7 +419,11 @@ impl Sanitize for Protocol {
 
 // Retains only CRDS values associated with nodes with enough stake.
 // (some crds types are exempted)
-fn retain_staked(values: &mut Vec<CrdsValue>, stakes: &HashMap<Pubkey, u64>) {
+fn retain_staked(
+    values: &mut Vec<CrdsValue>,
+    stakes: &HashMap<Pubkey, u64>,
+    drop_unstaked_node_instance: bool,
+) {
     values.retain(|value| {
         match value.data {
             CrdsData::ContactInfo(_) => true,
@@ -433,13 +437,14 @@ fn retain_staked(values: &mut Vec<CrdsValue>, stakes: &HashMap<Pubkey, u64>) {
             // Otherwise unstaked voting nodes will show up with no version in
             // the various dashboards.
             CrdsData::Version(_) => true,
-            CrdsData::NodeInstance(_) => true,
             CrdsData::AccountsHashes(_) => true,
+            CrdsData::NodeInstance(_) if !drop_unstaked_node_instance => true,
             CrdsData::LowestSlot(_, _)
             | CrdsData::LegacyVersion(_)
             | CrdsData::DuplicateShred(_, _)
             | CrdsData::RestartHeaviestFork(_)
-            | CrdsData::RestartLastVotedForkSlots(_) => {
+            | CrdsData::RestartLastVotedForkSlots(_)
+            | CrdsData::NodeInstance(_) => {
                 let stake = stakes.get(&value.pubkey()).copied();
                 stake.unwrap_or_default() >= MIN_STAKE_FOR_GOSSIP
             }
@@ -679,7 +684,7 @@ impl ClusterInfo {
             *instance = NodeInstance::new(&mut thread_rng(), id, timestamp());
         }
         *self.keypair.write().unwrap() = new_keypair;
-        self.my_contact_info.write().unwrap().set_pubkey(id);
+        self.my_contact_info.write().unwrap().hot_swap_pubkey(id);
 
         self.refresh_my_gossip_contact_info();
         self.push_message(CrdsValue::new_signed(
@@ -1646,7 +1651,7 @@ impl ClusterInfo {
             .add_relaxed(num_nodes as u64);
         if self.require_stake_for_gossip(stakes) {
             push_messages.retain(|_, data| {
-                retain_staked(data, stakes);
+                retain_staked(data, stakes, /* drop_unstaked_node_instance */ false);
                 !data.is_empty()
             })
         }
@@ -1890,7 +1895,7 @@ impl ClusterInfo {
                         Some(ref bank_forks) => {
                             let root_bank = bank_forks.read().unwrap().root_bank();
                             (
-                                root_bank.staked_nodes(),
+                                root_bank.current_epoch_staked_nodes(),
                                 Some(root_bank.feature_set.clone()),
                             )
                         }
@@ -2138,7 +2143,7 @@ impl ClusterInfo {
         };
         if self.require_stake_for_gossip(stakes) {
             for resp in &mut pull_responses {
-                retain_staked(resp, stakes);
+                retain_staked(resp, stakes, /* drop_unstaked_node_instance */ true);
             }
         }
         let (responses, scores): (Vec<_>, Vec<_>) = addrs
@@ -2392,9 +2397,6 @@ impl ClusterInfo {
                     .collect()
             })
         };
-        if prune_messages.is_empty() {
-            return;
-        }
         let mut packet_batch = PacketBatch::new_unpinned_with_recycler_data_and_dests(
             recycler,
             "handle_batch_push_messages",
@@ -2424,7 +2426,9 @@ impl ClusterInfo {
         self.stats
             .packets_sent_push_messages_count
             .add_relaxed((packet_batch.len() - num_prune_packets) as u64);
-        let _ = response_sender.send(packet_batch);
+        if !packet_batch.is_empty() {
+            let _ = response_sender.send(packet_batch);
+        }
     }
 
     fn require_stake_for_gossip(&self, stakes: &HashMap<Pubkey, u64>) -> bool {
@@ -2475,16 +2479,21 @@ impl ClusterInfo {
 
         // Check if there is a duplicate instance of
         // this node with more recent timestamp.
-        let instance = self.instance.read().unwrap();
-        let check_duplicate_instance = |values: &[CrdsValue]| {
-            if should_check_duplicate_instance {
-                for value in values {
-                    if instance.check_duplicate(value) {
-                        return Err(GossipError::DuplicateNodeInstance);
-                    }
+        let check_duplicate_instance = {
+            let instance = self.instance.read().unwrap();
+            let my_contact_info = self.my_contact_info();
+            move |values: &[CrdsValue]| {
+                if should_check_duplicate_instance
+                    && values.iter().any(|value| {
+                        instance.check_duplicate(value)
+                            || matches!(&value.data, CrdsData::ContactInfo(other)
+                                if my_contact_info.check_duplicate(other))
+                    })
+                {
+                    return Err(GossipError::DuplicateNodeInstance);
                 }
+                Ok(())
             }
-            Ok(())
         };
         let mut pings = Vec::new();
         let mut rng = rand::thread_rng();
@@ -2539,9 +2548,13 @@ impl ClusterInfo {
             }
         }
         if self.require_stake_for_gossip(stakes) {
-            retain_staked(&mut pull_responses, stakes);
+            retain_staked(
+                &mut pull_responses,
+                stakes,
+                /* drop_unstaked_node_instance */ false,
+            );
             for (_, data) in &mut push_messages {
-                retain_staked(data, stakes);
+                retain_staked(data, stakes, /* drop_unstaked_node_instance */ false);
             }
             push_messages.retain(|(_, data)| !data.is_empty());
         }
@@ -2690,7 +2703,7 @@ impl ClusterInfo {
             Some(bank_forks) => {
                 let bank = bank_forks.read().unwrap().root_bank();
                 let feature_set = bank.feature_set.clone();
-                (Some(feature_set), bank.staked_nodes())
+                (Some(feature_set), bank.current_epoch_staked_nodes())
             }
         };
         self.process_packets(
@@ -2861,11 +2874,19 @@ pub struct Sockets {
     pub tpu_forwards: Vec<UdpSocket>,
     pub tpu_vote: Vec<UdpSocket>,
     pub broadcast: Vec<UdpSocket>,
+    // Socket sending out local repair requests,
+    // and receiving repair responses from the cluster.
     pub repair: UdpSocket,
+    pub repair_quic: UdpSocket,
     pub retransmit_sockets: Vec<UdpSocket>,
+    // Socket receiving remote repair requests from the cluster,
+    // and sending back repair responses.
     pub serve_repair: UdpSocket,
     pub serve_repair_quic: UdpSocket,
+    // Socket sending out local RepairProtocol::AncestorHashes,
+    // and receiving AncestorHashesResponse from the cluster.
     pub ancestor_hashes_requests: UdpSocket,
+    pub ancestor_hashes_requests_quic: UdpSocket,
     pub tpu_quic: Vec<UdpSocket>,
     pub tpu_forwards_quic: Vec<UdpSocket>,
 }
@@ -2938,6 +2959,7 @@ impl Node {
             bind_more_with_config(tpu_forwards_quic, num_quic_endpoints, quic_config).unwrap();
         let tpu_vote = UdpSocket::bind(&localhost_bind_addr).unwrap();
         let repair = UdpSocket::bind(&localhost_bind_addr).unwrap();
+        let repair_quic = UdpSocket::bind(&localhost_bind_addr).unwrap();
         let rpc_port = find_available_port_in_range(localhost_ip_addr, port_range).unwrap();
         let rpc_addr = SocketAddr::new(localhost_ip_addr, rpc_port);
         let rpc_pubsub_port = find_available_port_in_range(localhost_ip_addr, port_range).unwrap();
@@ -2947,6 +2969,7 @@ impl Node {
         let serve_repair = UdpSocket::bind(&localhost_bind_addr).unwrap();
         let serve_repair_quic = UdpSocket::bind(&localhost_bind_addr).unwrap();
         let ancestor_hashes_requests = UdpSocket::bind(&unspecified_bind_addr).unwrap();
+        let ancestor_hashes_requests_quic = UdpSocket::bind(&unspecified_bind_addr).unwrap();
 
         let mut info = ContactInfo::new(
             *pubkey,
@@ -2995,10 +3018,12 @@ impl Node {
                 tpu_vote: vec![tpu_vote],
                 broadcast,
                 repair,
+                repair_quic,
                 retransmit_sockets: vec![retransmit_socket],
                 serve_repair,
                 serve_repair_quic,
                 ancestor_hashes_requests,
+                ancestor_hashes_requests_quic,
                 tpu_quic,
                 tpu_forwards_quic,
             },
@@ -3071,10 +3096,12 @@ impl Node {
         let (tpu_vote_port, tpu_vote) = Self::bind(bind_ip_addr, port_range);
         let (_, retransmit_socket) = Self::bind(bind_ip_addr, port_range);
         let (_, repair) = Self::bind(bind_ip_addr, port_range);
+        let (_, repair_quic) = Self::bind(bind_ip_addr, port_range);
         let (serve_repair_port, serve_repair) = Self::bind(bind_ip_addr, port_range);
         let (serve_repair_quic_port, serve_repair_quic) = Self::bind(bind_ip_addr, port_range);
         let (_, broadcast) = Self::bind(bind_ip_addr, port_range);
         let (_, ancestor_hashes_requests) = Self::bind(bind_ip_addr, port_range);
+        let (_, ancestor_hashes_requests_quic) = Self::bind(bind_ip_addr, port_range);
 
         let rpc_port = find_available_port_in_range(bind_ip_addr, port_range).unwrap();
         let rpc_pubsub_port = find_available_port_in_range(bind_ip_addr, port_range).unwrap();
@@ -3121,10 +3148,12 @@ impl Node {
                 tpu_vote: vec![tpu_vote],
                 broadcast: vec![broadcast],
                 repair,
+                repair_quic,
                 retransmit_sockets: vec![retransmit_socket],
                 serve_repair,
                 serve_repair_quic,
                 ancestor_hashes_requests,
+                ancestor_hashes_requests_quic,
                 tpu_quic,
                 tpu_forwards_quic,
             },
@@ -3186,6 +3215,7 @@ impl Node {
             multi_bind_in_range(bind_ip_addr, port_range, 8).expect("retransmit multi_bind");
 
         let (_, repair) = Self::bind(bind_ip_addr, port_range);
+        let (_, repair_quic) = Self::bind(bind_ip_addr, port_range);
         let (serve_repair_port, serve_repair) = Self::bind(bind_ip_addr, port_range);
         let (serve_repair_quic_port, serve_repair_quic) = Self::bind(bind_ip_addr, port_range);
 
@@ -3193,6 +3223,7 @@ impl Node {
             multi_bind_in_range(bind_ip_addr, port_range, 4).expect("broadcast multi_bind");
 
         let (_, ancestor_hashes_requests) = Self::bind(bind_ip_addr, port_range);
+        let (_, ancestor_hashes_requests_quic) = Self::bind(bind_ip_addr, port_range);
 
         let mut info = ContactInfo::new(
             *pubkey,
@@ -3226,11 +3257,13 @@ impl Node {
                 tpu_vote: tpu_vote_sockets,
                 broadcast,
                 repair,
+                repair_quic,
                 retransmit_sockets,
                 serve_repair,
                 serve_repair_quic,
                 ip_echo: Some(ip_echo),
                 ancestor_hashes_requests,
+                ancestor_hashes_requests_quic,
                 tpu_quic,
                 tpu_forwards_quic,
             },

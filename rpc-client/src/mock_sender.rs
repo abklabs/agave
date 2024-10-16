@@ -30,7 +30,7 @@ use {
         sysvar::epoch_schedule::EpochSchedule,
         transaction::{self, Transaction, TransactionError, TransactionVersion},
     },
-    solana_transaction_status::{
+    solana_transaction_status_client_types::{
         option_serializer::OptionSerializer, EncodedConfirmedBlock,
         EncodedConfirmedTransactionWithStatusMeta, EncodedTransaction,
         EncodedTransactionWithStatusMeta, Rewards, TransactionBinaryEncoding,
@@ -242,11 +242,7 @@ impl RpcSender for MockSender {
                             range: RpcBlockProductionRange {
                                 first_slot: config_range.first_slot,
                                 last_slot: {
-                                    if let Some(last_slot) = config_range.last_slot {
-                                        last_slot
-                                    } else {
-                                        2
-                                    }
+                                    config_range.last_slot.unwrap_or(2)
                                 },
                             },
                         },

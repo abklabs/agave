@@ -24,7 +24,7 @@ use {
     regex::Regex,
     solana_accounts_db::{
         account_storage::{meta::StoredMetaWriteVersion, AccountStorageMap},
-        accounts_db::{AccountStorageEntry, AtomicAccountsFileId, BankHashStats},
+        accounts_db::{stats::BankHashStats, AccountStorageEntry, AtomicAccountsFileId},
         accounts_file::{AccountsFile, AccountsFileError, InternalsForArchive, StorageAccess},
         accounts_hash::{AccountsDeltaHash, AccountsHash},
         epoch_accounts_hash::EpochAccountsHash,
@@ -1083,8 +1083,9 @@ fn archive_snapshot(
                 encoder.finish().map_err(E::FinishEncoder)?;
             }
             ArchiveFormat::TarZstd => {
+                // Compression level of 1 is optimized for speed.
                 let mut encoder =
-                    zstd::stream::Encoder::new(archive_file, 0).map_err(E::CreateEncoder)?;
+                    zstd::stream::Encoder::new(archive_file, 1).map_err(E::CreateEncoder)?;
                 do_archive_files(&mut encoder)?;
                 encoder.finish().map_err(E::FinishEncoder)?;
             }

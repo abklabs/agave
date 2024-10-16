@@ -10,7 +10,7 @@ use {
         runtime_config::RuntimeConfig,
         serde_snapshot::storage::SerializableAccountStorageEntry,
         snapshot_utils::{SnapshotError, StorageAndNextAccountsFileId},
-        stakes::{serde_stakes_enum_compat, Stakes, StakesEnum},
+        stakes::{serde_stakes_to_delegation_format, Stakes, StakesEnum},
     },
     bincode::{self, config::Options, Error},
     log::*,
@@ -19,8 +19,9 @@ use {
         account_storage::meta::StoredMetaWriteVersion,
         accounts::Accounts,
         accounts_db::{
-            AccountShrinkThreshold, AccountStorageEntry, AccountsDb, AccountsDbConfig,
-            AccountsFileId, AtomicAccountsFileId, BankHashStats, IndexGenerationInfo,
+            stats::BankHashStats, AccountShrinkThreshold, AccountStorageEntry, AccountsDb,
+            AccountsDbConfig, AccountsFileId, AtomicAccountsFileId, DuplicatesLtHash,
+            IndexGenerationInfo,
         },
         accounts_file::{AccountsFile, StorageAccess},
         accounts_hash::{AccountsDeltaHash, AccountsHash},
@@ -57,10 +58,12 @@ use {
         thread::Builder,
     },
     storage::SerializableStorage,
+    types::SerdeAccountsLtHash,
 };
 
 mod storage;
 mod tests;
+mod types;
 mod utils;
 
 pub(crate) use {
@@ -237,7 +240,7 @@ struct SerializableVersionedBank {
     rent_collector: RentCollector,
     epoch_schedule: EpochSchedule,
     inflation: Inflation,
-    #[serde(serialize_with = "serde_stakes_enum_compat::serialize")]
+    #[serde(serialize_with = "serde_stakes_to_delegation_format::serialize")]
     stakes: StakesEnum,
     unused_accounts: UnusedAccounts,
     epoch_stakes: HashMap<Epoch, EpochStakes>,
@@ -283,7 +286,7 @@ impl From<BankFieldsToSerialize> for SerializableVersionedBank {
     }
 }
 
-#[cfg(all(RUSTC_WITH_SPECIALIZATION, feature = "frozen-abi"))]
+#[cfg(feature = "frozen-abi")]
 impl solana_frozen_abi::abi_example::TransparentAsHelper for SerializableVersionedBank {}
 
 /// Helper type to wrap BufReader streams when deserializing and reconstructing from either just a
@@ -389,7 +392,8 @@ where
 /// added to this struct a minor release before they are added to the serialize
 /// struct.
 #[cfg_attr(feature = "frozen-abi", derive(AbiExample))]
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[cfg_attr(feature = "dev-context-only-utils", derive(PartialEq))]
+#[derive(Clone, Debug, Deserialize)]
 struct ExtraFieldsToDeserialize {
     #[serde(deserialize_with = "default_on_eof")]
     lamports_per_signature: u64,
@@ -399,6 +403,9 @@ struct ExtraFieldsToDeserialize {
     epoch_accounts_hash: Option<Hash>,
     #[serde(deserialize_with = "default_on_eof")]
     versioned_epoch_stakes: HashMap<u64, VersionedEpochStakes>,
+    #[serde(deserialize_with = "default_on_eof")]
+    #[allow(dead_code)]
+    accounts_lt_hash: Option<SerdeAccountsLtHash>,
 }
 
 /// Extra fields that are serialized at the end of snapshots.
@@ -408,8 +415,8 @@ struct ExtraFieldsToDeserialize {
 /// be added to the deserialize struct a minor release before they are added to
 /// this one.
 #[cfg_attr(feature = "frozen-abi", derive(AbiExample))]
-#[cfg_attr(feature = "dev-context-only-utils", derive(Default))]
-#[derive(Debug, Serialize, PartialEq)]
+#[cfg_attr(feature = "dev-context-only-utils", derive(Default, PartialEq))]
+#[derive(Debug, Serialize)]
 pub struct ExtraFieldsToSerialize<'a> {
     pub lamports_per_signature: u64,
     pub incremental_snapshot_persistence: Option<&'a BankIncrementalSnapshotPersistence>,
@@ -440,6 +447,7 @@ where
         incremental_snapshot_persistence,
         epoch_accounts_hash,
         versioned_epoch_stakes,
+        accounts_lt_hash: _,
     } = extra_fields;
 
     bank_fields.fee_rate_governor = bank_fields
@@ -538,6 +546,12 @@ pub(crate) fn fields_from_streams(
     Ok((snapshot_bank_fields, snapshot_accounts_db_fields))
 }
 
+/// This struct contains side-info while reconstructing the bank from streams
+#[derive(Debug)]
+pub struct BankFromStreamsInfo {
+    pub duplicates_lt_hash: Box<DuplicatesLtHash>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn bank_from_streams<R>(
     snapshot_streams: &mut SnapshotStreams<R>,
@@ -554,12 +568,12 @@ pub(crate) fn bank_from_streams<R>(
     accounts_db_config: Option<AccountsDbConfig>,
     accounts_update_notifier: Option<AccountsUpdateNotifier>,
     exit: Arc<AtomicBool>,
-) -> std::result::Result<Bank, Error>
+) -> std::result::Result<(Bank, BankFromStreamsInfo), Error>
 where
     R: Read,
 {
     let (bank_fields, accounts_db_fields) = fields_from_streams(snapshot_streams)?;
-    reconstruct_bank_from_fields(
+    let (bank, info) = reconstruct_bank_from_fields(
         bank_fields,
         accounts_db_fields,
         genesis_config,
@@ -575,7 +589,13 @@ where
         accounts_db_config,
         accounts_update_notifier,
         exit,
-    )
+    )?;
+    Ok((
+        bank,
+        BankFromStreamsInfo {
+            duplicates_lt_hash: info.duplicates_lt_hash,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -816,8 +836,14 @@ impl<'a> Serialize for SerializableAccountsDb<'a> {
     }
 }
 
-#[cfg(all(RUSTC_WITH_SPECIALIZATION, feature = "frozen-abi"))]
+#[cfg(feature = "frozen-abi")]
 impl<'a> solana_frozen_abi::abi_example::TransparentAsHelper for SerializableAccountsDb<'a> {}
+
+/// This struct contains side-info while reconstructing the bank from fields
+#[derive(Debug)]
+struct ReconstructedBankInfo {
+    duplicates_lt_hash: Box<DuplicatesLtHash>,
+}
 
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_bank_from_fields<E>(
@@ -836,7 +862,7 @@ fn reconstruct_bank_from_fields<E>(
     accounts_db_config: Option<AccountsDbConfig>,
     accounts_update_notifier: Option<AccountsUpdateNotifier>,
     exit: Arc<AtomicBool>,
-) -> Result<Bank, Error>
+) -> Result<(Bank, ReconstructedBankInfo), Error>
 where
     E: SerializableStorage + std::marker::Sync,
 {
@@ -883,7 +909,12 @@ where
 
     info!("rent_collector: {:?}", bank.rent_collector());
 
-    Ok(bank)
+    Ok((
+        bank,
+        ReconstructedBankInfo {
+            duplicates_lt_hash: reconstructed_accounts_db_info.duplicates_lt_hash,
+        },
+    ))
 }
 
 pub(crate) fn reconstruct_single_storage(
@@ -1003,9 +1034,10 @@ pub(crate) fn remap_and_reconstruct_single_storage(
 }
 
 /// This struct contains side-info while reconstructing the accounts DB from fields.
-#[derive(Debug, Default, Copy, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct ReconstructedAccountsDbInfo {
     pub accounts_data_len: u64,
+    pub duplicates_lt_hash: Box<DuplicatesLtHash>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1213,6 +1245,7 @@ where
     let IndexGenerationInfo {
         accounts_data_len,
         rent_paying_accounts_by_partition,
+        duplicates_lt_hash,
     } = accounts_db.generate_index(
         limit_load_slot_count_from_snapshot,
         verify_index,
@@ -1234,7 +1267,10 @@ where
 
     Ok((
         Arc::try_unwrap(accounts_db).unwrap(),
-        ReconstructedAccountsDbInfo { accounts_data_len },
+        ReconstructedAccountsDbInfo {
+            accounts_data_len,
+            duplicates_lt_hash,
+        },
     ))
 }
 

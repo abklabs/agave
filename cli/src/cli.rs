@@ -269,6 +269,7 @@ pub enum CliCommand {
         use_lamports_unit: bool,
         with_rewards: Option<usize>,
         use_csv: bool,
+        starting_epoch: Option<u64>,
     },
     StakeAuthorize {
         stake_account_pubkey: Pubkey,
@@ -338,12 +339,14 @@ pub enum CliCommand {
         memo: Option<String>,
         fee_payer: SignerIndex,
         compute_unit_price: Option<u64>,
+        cluster_authority: SignerIndex,
     },
     ShowVoteAccount {
         pubkey: Pubkey,
         use_lamports_unit: bool,
         use_csv: bool,
         with_rewards: Option<usize>,
+        starting_epoch: Option<u64>,
     },
     WithdrawFromVoteAccount {
         vote_account_pubkey: Pubkey,
@@ -1325,6 +1328,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             use_lamports_unit,
             with_rewards,
             use_csv,
+            starting_epoch,
         } => process_show_stake_account(
             &rpc_client,
             config,
@@ -1332,6 +1336,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             *use_lamports_unit,
             *with_rewards,
             *use_csv,
+            *starting_epoch,
         ),
         CliCommand::ShowStakeHistory {
             use_lamports_unit,
@@ -1471,6 +1476,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             memo,
             fee_payer,
             compute_unit_price,
+            cluster_authority,
         } => process_create_vote_account(
             &rpc_client,
             config,
@@ -1488,12 +1494,14 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             memo.as_ref(),
             *fee_payer,
             *compute_unit_price,
+            *cluster_authority,
         ),
         CliCommand::ShowVoteAccount {
             pubkey: vote_account_pubkey,
             use_lamports_unit,
             use_csv,
             with_rewards,
+            starting_epoch,
         } => process_show_vote_account(
             &rpc_client,
             config,
@@ -1501,6 +1509,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             *use_lamports_unit,
             *use_csv,
             *with_rewards,
+            *starting_epoch,
         ),
         CliCommand::WithdrawFromVoteAccount {
             vote_account_pubkey,
@@ -2133,6 +2142,7 @@ mod tests {
             memo: None,
             fee_payer: 0,
             compute_unit_price: None,
+            cluster_authority: 3,
         };
         config.signers = vec![&keypair, &bob_keypair, &identity_keypair];
         let result = process_command(&config);
@@ -2392,6 +2402,7 @@ mod tests {
             memo: None,
             fee_payer: 0,
             compute_unit_price: None,
+            cluster_authority: 3,
         };
         config.signers = vec![&keypair, &bob_keypair, &identity_keypair];
         assert!(process_command(&config).is_err());

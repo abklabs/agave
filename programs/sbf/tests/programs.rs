@@ -9,11 +9,13 @@
 
 #[cfg(feature = "sbf_rust")]
 use {
+    borsh::{from_slice, to_vec, BorshDeserialize, BorshSerialize},
     itertools::izip,
     solana_account_decoder::parse_bpf_loader::{
         parse_bpf_upgradeable_loader, BpfUpgradeableLoaderAccountType,
     },
     solana_compute_budget::compute_budget::ComputeBudget,
+    solana_feature_set::{self as feature_set, FeatureSet},
     solana_ledger::token_balances::collect_token_balances,
     solana_program_runtime::invoke_context::mock_process_instruction,
     solana_rbpf::vm::ContextObject,
@@ -43,7 +45,6 @@ use {
         clock::{UnixTimestamp, MAX_PROCESSING_AGE},
         compute_budget::ComputeBudgetInstruction,
         entrypoint::MAX_PERMITTED_DATA_INCREASE,
-        feature_set::{self, FeatureSet},
         fee::{FeeBudgetLimits, FeeStructure},
         fee_calculator::FeeRateGovernor,
         genesis_config::ClusterType,
@@ -61,15 +62,17 @@ use {
         transaction::{SanitizedTransaction, Transaction, TransactionError, VersionedTransaction},
     },
     solana_svm::{
-        transaction_commit_result::CommittedTransaction,
-        transaction_execution_result::{InnerInstruction, TransactionExecutionDetails},
+        transaction_commit_result::{CommittedTransaction, TransactionCommitResult},
+        transaction_execution_result::InnerInstruction,
         transaction_processor::ExecutionRecordingConfig,
     },
+    solana_svm_transaction::svm_message::SVMMessage,
     solana_timings::ExecuteTimings,
     solana_transaction_status::{
         map_inner_instructions, ConfirmedTransactionWithStatusMeta, TransactionStatusMeta,
         TransactionWithStatusMeta, VersionedTransactionWithStatusMeta,
     },
+    solana_type_overrides::rand,
     std::{
         assert_eq,
         cell::RefCell,
@@ -89,6 +92,20 @@ fn process_transaction_and_record_inner(
     Vec<Vec<InnerInstruction>>,
     Vec<String>,
 ) {
+    let commit_result = load_execute_and_commit_transaction(bank, tx);
+    let CommittedTransaction {
+        inner_instructions,
+        log_messages,
+        status,
+        ..
+    } = commit_result.unwrap();
+    let inner_instructions = inner_instructions.expect("cpi recording should be enabled");
+    let log_messages = log_messages.expect("log recording should be enabled");
+    (status, inner_instructions, log_messages)
+}
+
+#[cfg(feature = "sbf_rust")]
+fn load_execute_and_commit_transaction(bank: &Bank, tx: Transaction) -> TransactionCommitResult {
     let txs = vec![tx];
     let tx_batch = bank.prepare_batch_for_tests(txs);
     let mut commit_results = bank
@@ -105,15 +122,7 @@ fn process_transaction_and_record_inner(
             None,
         )
         .0;
-    let TransactionExecutionDetails {
-        inner_instructions,
-        log_messages,
-        status,
-        ..
-    } = commit_results.swap_remove(0).unwrap().execution_details;
-    let inner_instructions = inner_instructions.expect("cpi recording should be enabled");
-    let log_messages = log_messages.expect("log recording should be enabled");
-    (status, inner_instructions, log_messages)
+    commit_results.pop().unwrap()
 }
 
 #[cfg(feature = "sbf_rust")]
@@ -161,16 +170,12 @@ fn execute_transactions(
         )| {
             commit_result.map(|committed_tx| {
                 let CommittedTransaction {
+                    status,
+                    log_messages,
+                    inner_instructions,
+                    return_data,
+                    executed_units,
                     fee_details,
-                    execution_details:
-                        TransactionExecutionDetails {
-                            status,
-                            log_messages,
-                            inner_instructions,
-                            return_data,
-                            executed_units,
-                            ..
-                        },
                     ..
                 } = committed_tx;
 
@@ -329,7 +334,7 @@ fn test_program_sbf_loader_deprecated() {
         } = create_genesis_config(50);
         genesis_config
             .accounts
-            .remove(&solana_sdk::feature_set::disable_deploy_of_alloc_free_syscall::id())
+            .remove(&solana_feature_set::disable_deploy_of_alloc_free_syscall::id())
             .unwrap();
         let (bank, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
         let program_id = create_program(&bank, &bpf_loader_deprecated::id(), program);
@@ -1881,10 +1886,10 @@ fn test_program_sbf_invoke_in_same_tx_as_deployment() {
             bank.last_blockhash(),
         );
         if index == 0 {
-            let results = execute_transactions(&bank, vec![tx]);
+            let result = load_execute_and_commit_transaction(&bank, tx);
             assert_eq!(
-                results[0].as_ref().unwrap_err(),
-                &TransactionError::ProgramAccountNotFound,
+                result.unwrap().status,
+                Err(TransactionError::ProgramAccountNotFound),
             );
         } else {
             let (result, _, _) = process_transaction_and_record_inner(&bank, tx);
@@ -2239,9 +2244,7 @@ fn test_program_sbf_disguised_as_sbf_loader() {
             ..
         } = create_genesis_config(50);
         let mut bank = Bank::new_for_tests(&genesis_config);
-        bank.deactivate_feature(
-            &solana_sdk::feature_set::remove_bpf_loader_incorrect_program_id::id(),
-        );
+        bank.deactivate_feature(&solana_feature_set::remove_bpf_loader_incorrect_program_id::id());
         let (bank, bank_forks) = bank.wrap_with_bank_forks_for_tests();
         let mut bank_client = BankClient::new_shared(bank);
         let authority_keypair = Keypair::new();
@@ -3876,8 +3879,10 @@ fn test_program_fees() {
     )
     .unwrap();
     let fee_budget_limits = FeeBudgetLimits::from(
-        process_compute_budget_instructions(sanitized_message.program_instructions_iter())
-            .unwrap_or_default(),
+        process_compute_budget_instructions(SVMMessage::program_instructions_iter(
+            &sanitized_message,
+        ))
+        .unwrap_or_default(),
     );
     let expected_normal_fee = solana_fee::calculate_fee(
         &sanitized_message,
@@ -3906,8 +3911,10 @@ fn test_program_fees() {
     )
     .unwrap();
     let fee_budget_limits = FeeBudgetLimits::from(
-        process_compute_budget_instructions(sanitized_message.program_instructions_iter())
-            .unwrap_or_default(),
+        process_compute_budget_instructions(SVMMessage::program_instructions_iter(
+            &sanitized_message,
+        ))
+        .unwrap_or_default(),
     );
     let expected_prioritized_fee = solana_fee::calculate_fee(
         &sanitized_message,
@@ -5125,4 +5132,147 @@ fn test_stack_heap_zeroed() {
             "{logs:?}"
         );
     }
+}
+
+#[test]
+fn test_function_call_args() {
+    // This function tests edge compiler edge cases when calling functions with more than five
+    // arguments and passing by value arguments with more than 16 bytes.
+    solana_logger::setup();
+
+    let GenesisConfigInfo {
+        genesis_config,
+        mint_keypair,
+        ..
+    } = create_genesis_config(100_123_456_789);
+
+    let (bank, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+    let mut bank_client = BankClient::new_shared(bank);
+    let authority_keypair = Keypair::new();
+
+    let (bank, program_id) = load_upgradeable_program_and_advance_slot(
+        &mut bank_client,
+        bank_forks.as_ref(),
+        &mint_keypair,
+        &authority_keypair,
+        "solana_sbf_rust_call_args",
+    );
+
+    #[derive(BorshSerialize, BorshDeserialize, PartialEq, Eq, Debug)]
+    struct Test128 {
+        a: u128,
+        b: u128,
+    }
+
+    #[derive(BorshSerialize)]
+    struct InputData {
+        test_128: Test128,
+        arg1: i64,
+        arg2: i64,
+        arg3: i64,
+        arg4: i64,
+        arg5: i64,
+        arg6: i64,
+        arg7: i64,
+        arg8: i64,
+    }
+
+    #[derive(BorshDeserialize)]
+    struct OutputData {
+        res_128: u128,
+        res_256: Test128,
+        many_args_1: i64,
+        many_args_2: i64,
+    }
+
+    let input_data = InputData {
+        test_128: Test128 {
+            a: rand::random::<u128>(),
+            b: rand::random::<u128>(),
+        },
+        arg1: rand::random::<i64>(),
+        arg2: rand::random::<i64>(),
+        arg3: rand::random::<i64>(),
+        arg4: rand::random::<i64>(),
+        arg5: rand::random::<i64>(),
+        arg6: rand::random::<i64>(),
+        arg7: rand::random::<i64>(),
+        arg8: rand::random::<i64>(),
+    };
+
+    let instruction_data = to_vec(&input_data).unwrap();
+    let account_metas = vec![
+        AccountMeta::new(mint_keypair.pubkey(), true),
+        AccountMeta::new(Keypair::new().pubkey(), false),
+    ];
+
+    let instruction = Instruction::new_with_bytes(program_id, &instruction_data, account_metas);
+    let message = Message::new(&[instruction], Some(&mint_keypair.pubkey()));
+
+    let tx = Transaction::new(&[&mint_keypair], message.clone(), bank.last_blockhash());
+
+    let txs = vec![tx];
+    let tx_batch = bank.prepare_batch_for_tests(txs);
+    let result = bank
+        .load_execute_and_commit_transactions(
+            &tx_batch,
+            MAX_PROCESSING_AGE,
+            false,
+            ExecutionRecordingConfig {
+                enable_cpi_recording: false,
+                enable_log_recording: false,
+                enable_return_data_recording: true,
+            },
+            &mut ExecuteTimings::default(),
+            None,
+        )
+        .0;
+
+    fn verify_many_args(input: &InputData) -> i64 {
+        let a = input
+            .arg1
+            .overflowing_add(input.arg2)
+            .0
+            .overflowing_sub(input.arg3)
+            .0
+            .overflowing_add(input.arg4)
+            .0
+            .overflowing_sub(input.arg5)
+            .0;
+        (a % input.arg6)
+            .overflowing_sub(input.arg7)
+            .0
+            .overflowing_add(input.arg8)
+            .0
+    }
+
+    let return_data = &result[0]
+        .as_ref()
+        .unwrap()
+        .return_data
+        .as_ref()
+        .unwrap()
+        .data;
+    let decoded: OutputData = from_slice::<OutputData>(return_data).unwrap();
+    assert_eq!(
+        decoded.res_128,
+        input_data.test_128.a % input_data.test_128.b
+    );
+    assert_eq!(
+        decoded.res_256,
+        Test128 {
+            a: input_data
+                .test_128
+                .a
+                .overflowing_add(input_data.test_128.b)
+                .0,
+            b: input_data
+                .test_128
+                .a
+                .overflowing_sub(input_data.test_128.b)
+                .0
+        }
+    );
+    assert_eq!(decoded.many_args_1, verify_many_args(&input_data));
+    assert_eq!(decoded.many_args_2, verify_many_args(&input_data));
 }

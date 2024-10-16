@@ -12,7 +12,7 @@ use {
     },
     solana_core::{
         accounts_hash_verifier::AccountsHashVerifier,
-        snapshot_packager_service::SnapshotPackagerService,
+        snapshot_packager_service::{PendingSnapshotPackages, SnapshotPackagerService},
     },
     solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfo},
     solana_runtime::{
@@ -50,7 +50,7 @@ use {
         path::PathBuf,
         sync::{
             atomic::{AtomicBool, Ordering},
-            Arc, RwLock,
+            Arc, Mutex, RwLock,
         },
         time::{Duration, Instant},
     },
@@ -434,8 +434,14 @@ fn test_bank_forks_incremental_snapshot(
         INCREMENTAL_SNAPSHOT_ARCHIVE_INTERVAL_SLOTS * 5;
     const LAST_SLOT: Slot = FULL_SNAPSHOT_ARCHIVE_INTERVAL_SLOTS * 2 - 1;
 
-    info!("Running bank forks incremental snapshot test, full snapshot interval: {} slots, incremental snapshot interval: {} slots, last slot: {}, set root interval: {} slots",
-              FULL_SNAPSHOT_ARCHIVE_INTERVAL_SLOTS, INCREMENTAL_SNAPSHOT_ARCHIVE_INTERVAL_SLOTS, LAST_SLOT, SET_ROOT_INTERVAL);
+    info!(
+        "Running bank forks incremental snapshot test, full snapshot interval: {} slots, \
+         incremental snapshot interval: {} slots, last slot: {}, set root interval: {} slots",
+        FULL_SNAPSHOT_ARCHIVE_INTERVAL_SLOTS,
+        INCREMENTAL_SNAPSHOT_ARCHIVE_INTERVAL_SLOTS,
+        LAST_SLOT,
+        SET_ROOT_INTERVAL
+    );
 
     let snapshot_test_config = SnapshotTestConfig::new(
         snapshot_version,
@@ -444,8 +450,20 @@ fn test_bank_forks_incremental_snapshot(
         FULL_SNAPSHOT_ARCHIVE_INTERVAL_SLOTS,
         INCREMENTAL_SNAPSHOT_ARCHIVE_INTERVAL_SLOTS,
     );
-    trace!("SnapshotTestConfig:\naccounts_dir: {}\nbank_snapshots_dir: {}\nfull_snapshot_archives_dir: {}\nincremental_snapshot_archives_dir: {}",
-            snapshot_test_config.accounts_dir.display(), snapshot_test_config.bank_snapshots_dir.path().display(), snapshot_test_config.full_snapshot_archives_dir.path().display(), snapshot_test_config.incremental_snapshot_archives_dir.path().display());
+    trace!(
+        "SnapshotTestConfig:\naccounts_dir: {}\nbank_snapshots_dir: \
+         {}\nfull_snapshot_archives_dir: {}\nincremental_snapshot_archives_dir: {}",
+        snapshot_test_config.accounts_dir.display(),
+        snapshot_test_config.bank_snapshots_dir.path().display(),
+        snapshot_test_config
+            .full_snapshot_archives_dir
+            .path()
+            .display(),
+        snapshot_test_config
+            .incremental_snapshot_archives_dir
+            .path()
+            .display()
+    );
 
     let bank_forks = snapshot_test_config.bank_forks.clone();
     let mint_keypair = &snapshot_test_config.genesis_config_info.mint_keypair;
@@ -637,11 +655,11 @@ fn test_snapshots_with_background_services(
     info!("Running snapshots with background services test...");
     trace!(
         "Test configuration parameters:\
-        \n\tfull snapshot archive interval: {} slots\
-        \n\tincremental snapshot archive interval: {} slots\
-        \n\tbank snapshot interval: {} slots\
-        \n\tset root interval: {} slots\
-        \n\tlast slot: {}",
+         \n\tfull snapshot archive interval: {} slots\
+         \n\tincremental snapshot archive interval: {} slots\
+         \n\tbank snapshot interval: {} slots\
+         \n\tset root interval: {} slots\
+         \n\tlast slot: {}",
         FULL_SNAPSHOT_ARCHIVE_INTERVAL_SLOTS,
         INCREMENTAL_SNAPSHOT_ARCHIVE_INTERVAL_SLOTS,
         BANK_SNAPSHOT_INTERVAL_SLOTS,
@@ -667,7 +685,7 @@ fn test_snapshots_with_background_services(
     let (pruned_banks_sender, pruned_banks_receiver) = unbounded();
     let (snapshot_request_sender, snapshot_request_receiver) = unbounded();
     let (accounts_package_sender, accounts_package_receiver) = unbounded();
-    let (snapshot_package_sender, snapshot_package_receiver) = unbounded();
+    let pending_snapshot_packages = Arc::new(Mutex::new(PendingSnapshotPackages::default()));
 
     let bank_forks = snapshot_test_config.bank_forks.clone();
     bank_forks
@@ -700,8 +718,7 @@ fn test_snapshots_with_background_services(
 
     let exit = Arc::new(AtomicBool::new(false));
     let snapshot_packager_service = SnapshotPackagerService::new(
-        snapshot_package_sender.clone(),
-        snapshot_package_receiver,
+        pending_snapshot_packages.clone(),
         None,
         exit.clone(),
         cluster_info.clone(),
@@ -712,7 +729,7 @@ fn test_snapshots_with_background_services(
     let accounts_hash_verifier = AccountsHashVerifier::new(
         accounts_package_sender,
         accounts_package_receiver,
-        Some(snapshot_package_sender),
+        pending_snapshot_packages,
         exit.clone(),
         snapshot_test_config.snapshot_config.clone(),
     );
@@ -774,7 +791,8 @@ fn test_snapshots_with_background_services(
             {
                 assert!(
                     timer.elapsed() < MAX_WAIT_DURATION,
-                    "Waiting for full snapshot {slot} exceeded the {MAX_WAIT_DURATION:?} maximum wait duration!",
+                    "Waiting for full snapshot {slot} exceeded the {MAX_WAIT_DURATION:?} maximum \
+                     wait duration!",
                 );
                 std::thread::sleep(Duration::from_secs(1));
             }
@@ -792,7 +810,8 @@ fn test_snapshots_with_background_services(
             {
                 assert!(
                     timer.elapsed() < MAX_WAIT_DURATION,
-                    "Waiting for incremental snapshot {slot} exceeded the {MAX_WAIT_DURATION:?} maximum wait duration!",
+                    "Waiting for incremental snapshot {slot} exceeded the {MAX_WAIT_DURATION:?} \
+                     maximum wait duration!",
                 );
                 std::thread::sleep(Duration::from_secs(1));
             }

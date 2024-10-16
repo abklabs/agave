@@ -34,9 +34,7 @@ use {
     rand::Rng,
     rayon::iter::{IntoParallelIterator, ParallelIterator},
     rocksdb::{DBRawIterator, LiveFile},
-    solana_accounts_db::hardened_unpack::{
-        unpack_genesis_archive, MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
-    },
+    solana_accounts_db::hardened_unpack::unpack_genesis_archive,
     solana_entry::entry::{create_ticks, Entry},
     solana_measure::measure::Measure,
     solana_metrics::{
@@ -73,7 +71,7 @@ use {
         },
         convert::TryInto,
         fmt::Write,
-        fs,
+        fs::{self, File},
         io::{Error as IoError, ErrorKind},
         ops::Bound,
         path::{Path, PathBuf},
@@ -83,6 +81,7 @@ use {
             Arc, Mutex, RwLock,
         },
     },
+    tar,
     tempfile::{Builder, TempDir},
     thiserror::Error,
     trees::{Tree, TreeWalk},
@@ -301,6 +300,14 @@ impl SlotMetaWorkingSetEntry {
     }
 }
 
+pub fn banking_trace_path(path: &Path) -> PathBuf {
+    path.join("banking_trace")
+}
+
+pub fn banking_retrace_path(path: &Path) -> PathBuf {
+    path.join("banking_retrace")
+}
+
 impl Blockstore {
     pub fn db(self) -> Arc<Database> {
         self.db
@@ -311,7 +318,11 @@ impl Blockstore {
     }
 
     pub fn banking_trace_path(&self) -> PathBuf {
-        self.ledger_path.join("banking_trace")
+        banking_trace_path(&self.ledger_path)
+    }
+
+    pub fn banking_retracer_path(&self) -> PathBuf {
+        banking_retrace_path(&self.ledger_path)
     }
 
     /// Opens a Ledger in directory, provides "infinite" window of shreds
@@ -914,8 +925,8 @@ impl Blockstore {
     ///       but N.index() is less than the current slot_meta.received
     ///       for slot S.
     ///     - The slot is not currently full
-    ///     It means there's an alternate version of this slot. See
-    ///     `check_insert_data_shred` for more details.
+    ///       It means there's an alternate version of this slot. See
+    ///       `check_insert_data_shred` for more details.
     ///   - [`cf::ShredData`]: stores data shreds (in check_insert_data_shreds).
     ///   - [`cf::ShredCode`]: stores coding shreds (in check_insert_coding_shreds).
     ///   - [`cf::SlotMeta`]: the SlotMeta of the input `shreds` and their related
@@ -937,8 +948,7 @@ impl Blockstore {
     ///     shreds inside `shreds` will be updated and committed to
     ///     `cf::MerkleRootMeta`.
     ///   - [`cf::Index`]: stores (slot id, index to the index_working_set_entry)
-    ///     pair to the `cf::Index` column family for each index_working_set_entry
-    ///     which insert did occur in this function call.
+    ///     pair to the `cf::Index` column family for each index_working_set_entry which insert did occur in this function call.
     ///
     /// Arguments:
     ///  - `shreds`: the shreds to be inserted.
@@ -1814,6 +1824,17 @@ impl Blockstore {
                 );
                 return true;
             };
+            if let Err(e) = self.store_duplicate_slot(
+                slot,
+                conflicting_shred.clone(),
+                shred.clone().into_payload(),
+            ) {
+                warn!(
+                    "Unable to store conflicting merkle root duplicate proof for {slot} \
+                     {:?} {e}",
+                    shred.erasure_set(),
+                );
+            }
             duplicate_shreds.push(PossibleDuplicateShred::MerkleRootConflict(
                 shred.clone(),
                 conflicting_shred,
@@ -2871,12 +2892,11 @@ impl Blockstore {
         }
     }
 
-    pub fn write_transaction_status(
+    pub fn write_transaction_status<'a>(
         &self,
         slot: Slot,
         signature: Signature,
-        writable_keys: Vec<&Pubkey>,
-        readonly_keys: Vec<&Pubkey>,
+        keys_with_writable: impl Iterator<Item = (&'a Pubkey, bool)>,
         status: TransactionStatusMeta,
         transaction_index: usize,
     ) -> Result<()> {
@@ -2885,18 +2905,14 @@ impl Blockstore {
             .map_err(|_| BlockstoreError::TransactionIndexOverflow)?;
         self.transaction_status_cf
             .put_protobuf((signature, slot), &status)?;
-        for address in writable_keys {
+
+        for (address, writeable) in keys_with_writable {
             self.address_signatures_cf.put(
                 (*address, slot, transaction_index, signature),
-                &AddressSignatureMeta { writeable: true },
+                &AddressSignatureMeta { writeable },
             )?;
         }
-        for address in readonly_keys {
-            self.address_signatures_cf.put(
-                (*address, slot, transaction_index, signature),
-                &AddressSignatureMeta { writeable: false },
-            )?;
-        }
+
         Ok(())
     }
 
@@ -4049,6 +4065,13 @@ impl Blockstore {
         Ok(duplicate_slots_iterator.map(|(slot, _)| slot))
     }
 
+    pub fn has_existing_shreds_for_slot(&self, slot: Slot) -> bool {
+        match self.meta(slot).unwrap() {
+            Some(meta) => meta.received > 0,
+            None => false,
+        }
+    }
+
     /// Returns the max root or 0 if it does not exist
     pub fn max_root(&self) -> Slot {
         self.max_root.load(Ordering::Relaxed)
@@ -4296,17 +4319,17 @@ impl Blockstore {
     /// it handles the following two things:
     ///
     /// 1. based on the `SlotMetaWorkingSetEntry` for `slot`, check if `slot`
-    /// did not previously have a parent slot but does now.  If `slot` satisfies
-    /// this condition, update the Orphan property of both `slot` and its parent
-    /// slot based on their current orphan status.  Specifically:
+    ///    did not previously have a parent slot but does now.  If `slot` satisfies
+    ///    this condition, update the Orphan property of both `slot` and its parent
+    ///    slot based on their current orphan status.  Specifically:
     ///  - updates the orphan property of slot to no longer be an orphan because
     ///    it has a parent.
     ///  - adds the parent to the orphan column family if the parent's parent is
     ///    currently unknown.
     ///
     /// 2. if the `SlotMetaWorkingSetEntry` for `slot` indicates this slot
-    /// is newly connected to a parent slot, then this function will update
-    /// the is_connected property of all its direct and indirect children slots.
+    ///    is newly connected to a parent slot, then this function will update
+    ///    the is_connected property of all its direct and indirect children slots.
     ///
     /// This function may update column family [`cf::Orphans`] and indirectly
     /// update SlotMeta from its output parameter `new_chained_slots`.
@@ -4813,32 +4836,12 @@ pub fn create_new_ledger(
     drop(blockstore);
 
     let archive_path = ledger_path.join(DEFAULT_GENESIS_ARCHIVE);
-    let args = vec![
-        "jcfhS",
-        archive_path.to_str().unwrap(),
-        "-C",
-        ledger_path.to_str().unwrap(),
-        DEFAULT_GENESIS_FILE,
-        blockstore_dir,
-    ];
-    let output = std::process::Command::new("tar")
-        .env("COPYFILE_DISABLE", "1")
-        .args(args)
-        .output()
-        .unwrap();
-    if !output.status.success() {
-        use std::str::from_utf8;
-        error!("tar stdout: {}", from_utf8(&output.stdout).unwrap_or("?"));
-        error!("tar stderr: {}", from_utf8(&output.stderr).unwrap_or("?"));
-
-        return Err(BlockstoreError::Io(IoError::new(
-            ErrorKind::Other,
-            format!(
-                "Error trying to generate snapshot archive: {}",
-                output.status
-            ),
-        )));
-    }
+    let archive_file = File::create(&archive_path)?;
+    let encoder = bzip2::write::BzEncoder::new(archive_file, bzip2::Compression::best());
+    let mut archive = tar::Builder::new(encoder);
+    archive.append_path_with_name(ledger_path.join(DEFAULT_GENESIS_FILE), DEFAULT_GENESIS_FILE)?;
+    archive.append_dir_all(blockstore_dir, ledger_path.join(blockstore_dir))?;
+    archive.into_inner()?;
 
     // ensure the genesis archive can be unpacked and it is under
     // max_genesis_archive_unpacked_size, immediately after creating it above.
@@ -4956,6 +4959,22 @@ macro_rules! create_new_tmp_ledger {
         $crate::blockstore::create_new_ledger_from_name(
             $crate::tmp_ledger_name!(),
             $genesis_config,
+            $crate::macro_reexports::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
+            $crate::blockstore_options::LedgerColumnOptions::default(),
+        )
+    };
+}
+
+#[macro_export]
+macro_rules! create_new_tmp_ledger_with_size {
+    (
+        $genesis_config:expr,
+        $max_genesis_archive_unpacked_size:expr $(,)?
+    ) => {
+        $crate::blockstore::create_new_ledger_from_name(
+            $crate::tmp_ledger_name!(),
+            $genesis_config,
+            $max_genesis_archive_unpacked_size,
             $crate::blockstore_options::LedgerColumnOptions::default(),
         )
     };
@@ -4967,6 +4986,7 @@ macro_rules! create_new_tmp_ledger_fifo {
         $crate::blockstore::create_new_ledger_from_name(
             $crate::tmp_ledger_name!(),
             $genesis_config,
+            $crate::macro_reexports::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
             $crate::blockstore_options::LedgerColumnOptions {
                 shred_storage_type: $crate::blockstore_options::ShredStorageType::RocksFifo(
                     $crate::blockstore_options::BlockstoreRocksFifoOptions::new_for_tests(),
@@ -4983,6 +5003,7 @@ macro_rules! create_new_tmp_ledger_auto_delete {
         $crate::blockstore::create_new_ledger_from_name_auto_delete(
             $crate::tmp_ledger_name!(),
             $genesis_config,
+            $crate::macro_reexports::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
             $crate::blockstore_options::LedgerColumnOptions::default(),
         )
     };
@@ -4994,6 +5015,7 @@ macro_rules! create_new_tmp_ledger_fifo_auto_delete {
         $crate::blockstore::create_new_ledger_from_name_auto_delete(
             $crate::tmp_ledger_name!(),
             $genesis_config,
+            $crate::macro_reexports::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
             $crate::blockstore_options::LedgerColumnOptions {
                 shred_storage_type: $crate::blockstore_options::ShredStorageType::RocksFifo(
                     $crate::blockstore_options::BlockstoreRocksFifoOptions::new_for_tests(),
@@ -5020,10 +5042,15 @@ pub(crate) fn verify_shred_slots(slot: Slot, parent: Slot, root: Slot) -> bool {
 pub fn create_new_ledger_from_name(
     name: &str,
     genesis_config: &GenesisConfig,
+    max_genesis_archive_unpacked_size: u64,
     column_options: LedgerColumnOptions,
 ) -> (PathBuf, Hash) {
-    let (ledger_path, blockhash) =
-        create_new_ledger_from_name_auto_delete(name, genesis_config, column_options);
+    let (ledger_path, blockhash) = create_new_ledger_from_name_auto_delete(
+        name,
+        genesis_config,
+        max_genesis_archive_unpacked_size,
+        column_options,
+    );
     (ledger_path.into_path(), blockhash)
 }
 
@@ -5034,13 +5061,14 @@ pub fn create_new_ledger_from_name(
 pub fn create_new_ledger_from_name_auto_delete(
     name: &str,
     genesis_config: &GenesisConfig,
+    max_genesis_archive_unpacked_size: u64,
     column_options: LedgerColumnOptions,
 ) -> (TempDir, Hash) {
     let ledger_path = get_ledger_path_from_name_auto_delete(name);
     let blockhash = create_new_ledger(
         ledger_path.path(),
         genesis_config,
-        MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
+        max_genesis_archive_unpacked_size,
         column_options,
     )
     .unwrap();
@@ -5305,6 +5333,9 @@ pub mod tests {
         crossbeam_channel::unbounded,
         rand::{seq::SliceRandom, thread_rng},
         solana_account_decoder::parse_token::UiTokenAmount,
+        solana_accounts_db::hardened_unpack::{
+            open_genesis_config, MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
+        },
         solana_entry::entry::{next_entry, next_entry_mut},
         solana_runtime::bank::{Bank, RewardType},
         solana_sdk::{
@@ -5375,6 +5406,17 @@ pub mod tests {
         assert!(Path::new(ledger_path.path())
             .join(BLOCKSTORE_DIRECTORY_ROCKS_LEVEL)
             .exists());
+
+        assert_eq!(
+            genesis_config,
+            open_genesis_config(ledger_path.path(), MAX_GENESIS_ARCHIVE_UNPACKED_SIZE).unwrap()
+        );
+        // Remove DEFAULT_GENESIS_FILE to force extraction of DEFAULT_GENESIS_ARCHIVE
+        std::fs::remove_file(ledger_path.path().join(DEFAULT_GENESIS_FILE)).unwrap();
+        assert_eq!(
+            genesis_config,
+            open_genesis_config(ledger_path.path(), MAX_GENESIS_ARCHIVE_UNPACKED_SIZE).unwrap()
+        );
     }
 
     #[test]
@@ -8644,8 +8686,11 @@ pub mod tests {
             .write_transaction_status(
                 slot,
                 signature,
-                vec![&Pubkey::new_unique()],
-                vec![&Pubkey::new_unique()],
+                vec![
+                    (&Pubkey::new_unique(), true),
+                    (&Pubkey::new_unique(), false),
+                ]
+                .into_iter(),
                 TransactionStatusMeta {
                     fee: slot * 1_000,
                     ..TransactionStatusMeta::default()
@@ -9032,8 +9077,7 @@ pub mod tests {
             .write_transaction_status(
                 lowest_cleanup_slot,
                 signature1,
-                vec![&address0],
-                vec![],
+                vec![(&address0, true)].into_iter(),
                 TransactionStatusMeta::default(),
                 0,
             )
@@ -9042,8 +9086,7 @@ pub mod tests {
             .write_transaction_status(
                 lowest_available_slot,
                 signature2,
-                vec![&address1],
-                vec![],
+                vec![(&address1, true)].into_iter(),
                 TransactionStatusMeta::default(),
                 0,
             )
@@ -9411,8 +9454,7 @@ pub mod tests {
                 .write_transaction_status(
                     slot1,
                     signature,
-                    vec![&address0],
-                    vec![&address1],
+                    vec![(&address0, true), (&address1, false)].into_iter(),
                     TransactionStatusMeta::default(),
                     x as usize,
                 )
@@ -9425,8 +9467,7 @@ pub mod tests {
                 .write_transaction_status(
                     slot2,
                     signature,
-                    vec![&address0],
-                    vec![&address1],
+                    vec![(&address0, true), (&address1, false)].into_iter(),
                     TransactionStatusMeta::default(),
                     x as usize,
                 )
@@ -9438,8 +9479,7 @@ pub mod tests {
                 .write_transaction_status(
                     slot2,
                     signature,
-                    vec![&address0],
-                    vec![&address1],
+                    vec![(&address0, true), (&address1, false)].into_iter(),
                     TransactionStatusMeta::default(),
                     x as usize,
                 )
@@ -9452,8 +9492,7 @@ pub mod tests {
                 .write_transaction_status(
                     slot3,
                     signature,
-                    vec![&address0],
-                    vec![&address1],
+                    vec![(&address0, true), (&address1, false)].into_iter(),
                     TransactionStatusMeta::default(),
                     x as usize,
                 )
@@ -9536,8 +9575,11 @@ pub mod tests {
                         .write_transaction_status(
                             slot,
                             transaction.signatures[0],
-                            transaction.message.static_account_keys().iter().collect(),
-                            vec![],
+                            transaction
+                                .message
+                                .static_account_keys()
+                                .iter()
+                                .map(|key| (key, true)),
                             TransactionStatusMeta::default(),
                             counter,
                         )
@@ -9564,8 +9606,11 @@ pub mod tests {
                         .write_transaction_status(
                             slot,
                             transaction.signatures[0],
-                            transaction.message.static_account_keys().iter().collect(),
-                            vec![],
+                            transaction
+                                .message
+                                .static_account_keys()
+                                .iter()
+                                .map(|key| (key, true)),
                             TransactionStatusMeta::default(),
                             counter,
                         )

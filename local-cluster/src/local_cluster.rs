@@ -18,7 +18,7 @@ use {
         contact_info::{ContactInfo, Protocol},
         gossip_service::discover_cluster,
     },
-    solana_ledger::{create_new_tmp_ledger, shred::Shred},
+    solana_ledger::{create_new_tmp_ledger_with_size, shred::Shred},
     solana_rpc_client::rpc_client::RpcClient,
     solana_runtime::{
         genesis_utils::{
@@ -32,7 +32,6 @@ use {
         clock::{Slot, DEFAULT_DEV_SLOTS_PER_EPOCH, DEFAULT_TICKS_PER_SLOT, MAX_PROCESSING_AGE},
         commitment_config::CommitmentConfig,
         epoch_schedule::EpochSchedule,
-        feature_set,
         genesis_config::{ClusterType, GenesisConfig},
         message::Message,
         poh_config::PohConfig,
@@ -156,6 +155,7 @@ impl LocalCluster {
         cluster_lamports: u64,
         lamports_per_node: u64,
         socket_addr_space: SocketAddrSpace,
+        cluster_authority_keypair: Arc<Keypair>,
     ) -> Self {
         Self::new(
             &mut ClusterConfig::new_with_equal_stakes(
@@ -164,6 +164,7 @@ impl LocalCluster {
                 lamports_per_node,
             ),
             socket_addr_space,
+            cluster_authority_keypair,
         )
     }
 
@@ -188,7 +189,11 @@ impl LocalCluster {
         }
     }
 
-    pub fn new(config: &mut ClusterConfig, socket_addr_space: SocketAddrSpace) -> Self {
+    pub fn new(
+        config: &mut ClusterConfig,
+        socket_addr_space: SocketAddrSpace,
+        cluster_authority_keypair: Arc<Keypair>,
+    ) -> Self {
         assert_eq!(config.validator_configs.len(), config.node_stakes.len());
 
         let connection_cache = if config.tpu_use_quic {
@@ -312,9 +317,13 @@ impl LocalCluster {
             .native_instruction_processors
             .extend_from_slice(&config.native_instruction_processors);
 
-        let (leader_ledger_path, _blockhash) = create_new_tmp_ledger!(&genesis_config);
-        let leader_contact_info = leader_node.info.clone();
         let mut leader_config = safe_clone_config(&config.validator_configs[0]);
+        let (leader_ledger_path, _blockhash) = create_new_tmp_ledger_with_size!(
+            &genesis_config,
+            leader_config.max_genesis_archive_unpacked_size,
+        );
+
+        let leader_contact_info = leader_node.info.clone();
         leader_config.rpc_addrs = Some((
             leader_node.info.rpc().unwrap(),
             leader_node.info.rpc_pubsub().unwrap(),
@@ -388,6 +397,7 @@ impl LocalCluster {
                 key.clone(),
                 node_pubkey_to_vote_key.get(&key.pubkey()).cloned(),
                 socket_addr_space,
+                cluster_authority_keypair,
             );
         }
 
@@ -399,6 +409,7 @@ impl LocalCluster {
                 0,
                 Arc::new(Keypair::new()),
                 None,
+                cluster_authority_keypair.clone(),
                 socket_addr_space,
             );
         });
@@ -444,6 +455,7 @@ impl LocalCluster {
         stake: u64,
         validator_keypair: Arc<Keypair>,
         voting_keypair: Option<Arc<Keypair>>,
+        cluster_authority_keypair: Arc<Keypair>,
         socket_addr_space: SocketAddrSpace,
     ) -> Pubkey {
         self.do_add_validator(
@@ -452,6 +464,7 @@ impl LocalCluster {
             stake,
             validator_keypair,
             voting_keypair,
+            cluster_authority_keypair,
             socket_addr_space,
         )
     }
@@ -464,6 +477,7 @@ impl LocalCluster {
         validator_keypair: Arc<Keypair>,
         voting_keypair: Option<Arc<Keypair>>,
         socket_addr_space: SocketAddrSpace,
+        cluster_authority_keypair: Arc<Keypair>,
     ) -> Pubkey {
         self.do_add_validator(
             validator_config,
@@ -471,6 +485,7 @@ impl LocalCluster {
             stake,
             validator_keypair,
             voting_keypair,
+            cluster_authority_keypair,
             socket_addr_space,
         )
     }
@@ -482,6 +497,7 @@ impl LocalCluster {
         stake: u64,
         validator_keypair: Arc<Keypair>,
         mut voting_keypair: Option<Arc<Keypair>>,
+        cluster_authority_keypair: Arc<Keypair>,
         socket_addr_space: SocketAddrSpace,
     ) -> Pubkey {
         let client = self.build_tpu_quic_client().expect("tpu_client");
@@ -494,7 +510,10 @@ impl LocalCluster {
         let validator_pubkey = validator_keypair.pubkey();
         let validator_node = Node::new_localhost_with_pubkey(&validator_keypair.pubkey());
         let contact_info = validator_node.info.clone();
-        let (ledger_path, _blockhash) = create_new_tmp_ledger!(&self.genesis_config);
+        let (ledger_path, _blockhash) = create_new_tmp_ledger_with_size!(
+            &self.genesis_config,
+            validator_config.max_genesis_archive_unpacked_size,
+        );
 
         // Give the validator some lamports to setup vote accounts
         if is_listener {
@@ -514,6 +533,7 @@ impl LocalCluster {
             Self::setup_vote_and_stake_accounts(
                 &client,
                 voting_keypair.as_ref().unwrap(),
+                &cluster_authority_keypair,
                 &validator_keypair,
                 stake,
             )
@@ -751,10 +771,12 @@ impl LocalCluster {
     fn setup_vote_and_stake_accounts(
         client: &QuicTpuClient,
         vote_account: &Keypair,
+        cluster_authority_keypair: &Keypair,
         from_account: &Arc<Keypair>,
         amount: u64,
     ) -> Result<()> {
         let vote_account_pubkey = vote_account.pubkey();
+        let cluster_authority_pubkey = cluster_authority_keypair.pubkey();
         let node_pubkey = from_account.pubkey();
         info!(
             "setup_vote_and_stake_accounts: {}, {}, amount: {}",
@@ -771,19 +793,8 @@ impl LocalCluster {
             == 0
         {
             // 1) Create vote account
-            // Unlike the bootstrap validator we have to check if the new vote state is being used
-            // as the cluster is already running, and using the wrong account size will cause the
-            // InitializeAccount tx to fail
-            let use_current_vote_state = client
-                .rpc_client()
-                .poll_get_balance_with_commitment(
-                    &feature_set::vote_state_add_vote_latency::id(),
-                    CommitmentConfig::processed(),
-                )
-                .unwrap_or(0)
-                > 0;
-
             let instructions = vote_instruction::create_account_with_config(
+                &cluster_authority_pubkey,
                 &from_account.pubkey(),
                 &vote_account_pubkey,
                 &VoteInit {
@@ -794,8 +805,7 @@ impl LocalCluster {
                 },
                 amount,
                 vote_instruction::CreateVoteAccountConfig {
-                    space: vote_state::VoteStateVersions::vote_state_size_of(use_current_vote_state)
-                        as u64,
+                    space: vote_state::VoteStateVersions::vote_state_size_of(true) as u64,
                     ..vote_instruction::CreateVoteAccountConfig::default()
                 },
             );
