@@ -2,13 +2,25 @@ use crate::replay_stage::DUPLICATE_THRESHOLD;
 
 pub mod fork_choice;
 pub mod heaviest_subtree_fork_choice;
-pub(crate) mod latest_validator_votes_for_frozen_banks;
+pub mod latest_validator_votes_for_frozen_banks;
 pub mod progress_map;
 mod tower1_14_11;
 mod tower1_7_14;
 pub mod tower_storage;
 pub mod tree_diff;
 pub mod vote_stake_tracker;
+pub mod replay_stage;
+pub mod cluster_slots_service;
+pub mod cluster_info_vote_listener;
+
+#[macro_use]
+extern crate log;
+
+#[macro_use]
+extern crate serde_derive;
+
+#[macro_use]
+extern crate solana_metrics;
 
 use {
     self::{
@@ -165,7 +177,7 @@ pub type Stake = u64;
 pub type VotedStakes = HashMap<Slot, Stake>;
 pub type PubkeyVotes = Vec<(Pubkey, Slot)>;
 
-pub(crate) struct ComputedBankState {
+pub struct ComputedBankState {
     pub voted_stakes: VotedStakes,
     pub total_stake: Stake,
     pub fork_stake: Stake,
@@ -224,7 +236,7 @@ impl TowerVersions {
 
 #[cfg_attr(feature = "frozen-abi", derive(AbiExample))]
 #[derive(PartialEq, Eq, Debug, Default, Clone, Copy)]
-pub(crate) enum BlockhashStatus {
+pub enum BlockhashStatus {
     /// No vote since restart
     #[default]
     Uninitialized,
@@ -246,7 +258,7 @@ pub struct Tower {
     pub node_pubkey: Pubkey,
     pub(crate) threshold_depth: usize,
     threshold_size: f64,
-    pub(crate) vote_state: VoteState,
+    pub vote_state: VoteState,
     last_vote: VoteTransaction,
     #[serde(skip)]
     // The blockhash used in the last vote transaction, may or may not equal the
@@ -340,7 +352,7 @@ impl Tower {
     ) -> Self {
         let root_bank = bank_forks.root_bank();
         let (_progress, heaviest_subtree_fork_choice) =
-            crate::replay_stage::ReplayStage::initialize_progress_and_fork_choice(
+            crate::replay_stage::initialize_progress_and_fork_choice(
                 root_bank.deref(),
                 bank_forks.frozen_banks().values().cloned().collect(),
                 node_pubkey,
@@ -359,7 +371,7 @@ impl Tower {
         Self::new(node_pubkey, vote_account, root, &heaviest_bank)
     }
 
-    pub(crate) fn collect_vote_lockouts(
+    pub fn collect_vote_lockouts(
         vote_account_pubkey: &Pubkey,
         bank_slot: Slot,
         vote_accounts: &VoteAccountsHashMap,
@@ -510,7 +522,7 @@ impl Tower {
             .unwrap_or(false)
     }
 
-    pub(crate) fn is_slot_duplicate_confirmed(
+    pub fn is_slot_duplicate_confirmed(
         &self,
         slot: Slot,
         voted_stakes: &VotedStakes,
@@ -526,7 +538,7 @@ impl Tower {
         self.vote_state.tower()
     }
 
-    pub(crate) fn last_vote_tx_blockhash(&self) -> BlockhashStatus {
+    pub fn last_vote_tx_blockhash(&self) -> BlockhashStatus {
         self.last_vote_tx_blockhash
     }
 
@@ -573,11 +585,11 @@ impl Tower {
         self.last_vote_tx_blockhash = BlockhashStatus::Blockhash(new_vote_tx_blockhash);
     }
 
-    pub(crate) fn mark_last_vote_tx_blockhash_non_voting(&mut self) {
+    pub fn mark_last_vote_tx_blockhash_non_voting(&mut self) {
         self.last_vote_tx_blockhash = BlockhashStatus::NonVoting;
     }
 
-    pub(crate) fn mark_last_vote_tx_blockhash_hot_spare(&mut self) {
+    pub fn mark_last_vote_tx_blockhash_hot_spare(&mut self) {
         self.last_vote_tx_blockhash = BlockhashStatus::HotSpare;
     }
 
@@ -608,7 +620,7 @@ impl Tower {
 
     /// If we've recently updated the vote state by applying a new vote
     /// or syncing from a bank, generate the proper last_vote.
-    pub(crate) fn update_last_vote_from_vote_state(
+    pub fn update_last_vote_from_vote_state(
         &mut self,
         vote_hash: Hash,
         enable_tower_sync_ix: bool,

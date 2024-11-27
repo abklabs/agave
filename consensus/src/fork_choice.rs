@@ -1,12 +1,9 @@
 use {
     super::heaviest_subtree_fork_choice::HeaviestSubtreeForkChoice,
     crate::{
-        consensus::{
-            latest_validator_votes_for_frozen_banks::LatestValidatorVotesForFrozenBanks,
-            progress_map::ProgressMap, SwitchForkDecision, ThresholdDecision, Tower,
-            SWITCH_FORK_THRESHOLD,
-        },
-        replay_stage::HeaviestForkFailures,
+        latest_validator_votes_for_frozen_banks::LatestValidatorVotesForFrozenBanks,
+        progress_map::ProgressMap, replay_stage::HeaviestForkFailures, SwitchForkDecision,
+        ThresholdDecision, Tower, SWITCH_FORK_THRESHOLD,
     },
     solana_runtime::{bank::Bank, bank_forks::BankForks},
     solana_sdk::clock::Slot,

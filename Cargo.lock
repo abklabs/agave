@@ -6436,6 +6436,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "solana-consensus"
+version = "0.0.0"
+dependencies = [
+ "bincode",
+ "chrono",
+ "etcd-client",
+ "log",
+ "serde",
+ "serde_derive",
+ "solana-feature-set",
+ "solana-ledger",
+ "solana-measure",
+ "solana-metrics",
+ "solana-runtime",
+ "solana-sdk",
+ "solana-vote",
+ "solana-vote-program",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "solana-core"
 version = "2.2.0"
 dependencies = [
@@ -6479,6 +6501,7 @@ dependencies = [
  "solana-client",
  "solana-compute-budget",
  "solana-connection-cache",
+ "solana-consensus",
  "solana-core",
  "solana-cost-model",
  "solana-entry",

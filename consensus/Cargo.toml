@@ -1,0 +1,33 @@
+[package]
+name = "solana-consensus"
+version = "0.0.0"
+publish = false
+authors = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
+
+[dependencies]
+bincode = { workspace = true }
+chrono = { workspace = true }
+etcd-client = { workspace = true, features = ["tls"] }
+log = { workspace = true }
+serde = { workspace = true }
+serde_derive = { workspace = true }
+solana-feature-set = { workspace = true }
+solana-ledger = { workspace = true }
+solana-measure = { workspace = true }
+solana-metrics = { workspace = true }
+solana-runtime = { workspace = true }
+solana-sdk = { workspace = true }
+solana-vote = { workspace = true }
+solana-vote-program = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[features]
+dev-context-only-utils = ["solana-runtime/dev-context-only-utils"]
+
+[lints]
+workspace = true

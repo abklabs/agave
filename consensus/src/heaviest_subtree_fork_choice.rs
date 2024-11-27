@@ -1,7 +1,7 @@
 #[cfg(test)]
 use trees::{Tree, TreeWalk};
 use {
-    crate::consensus::{
+    crate::{
         fork_choice::ForkChoice,
         latest_validator_votes_for_frozen_banks::LatestValidatorVotesForFrozenBanks,
         progress_map::ProgressMap, tree_diff::TreeDiff, Tower,

@@ -32,6 +32,7 @@ members = [
     "client-test",
     "compute-budget",
     "connection-cache",
+    "consensus",
     "core",
     "cost-model",
     "curves/*",
@@ -418,6 +419,7 @@ solana-compute-budget = { path = "compute-budget", version = "=2.2.0" }
 solana-compute-budget-program = { path = "programs/compute-budget", version = "=2.2.0" }
 solana-config-program = { path = "programs/config", version = "=2.2.0" }
 solana-connection-cache = { path = "connection-cache", version = "=2.2.0", default-features = false }
+solana-consensus = { path = "consensus", version = "=0.0.0" }
 solana-core = { path = "core", version = "=2.2.0" }
 solana-cost-model = { path = "cost-model", version = "=2.2.0" }
 solana-cpi = { path = "sdk/cpi", version = "=2.2.0" }

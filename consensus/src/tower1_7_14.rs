@@ -1,5 +1,5 @@
 use {
-    crate::consensus::{BlockhashStatus, Result, SwitchForkDecision, TowerError},
+    crate::{BlockhashStatus, Result, SwitchForkDecision, TowerError},
     solana_sdk::{
         clock::Slot,
         pubkey::Pubkey,

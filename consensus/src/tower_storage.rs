@@ -1,5 +1,5 @@
 use {
-    crate::consensus::{
+    crate::{
         tower1_14_11::Tower1_14_11, tower1_7_14::SavedTower1_7_14, Result, Tower, TowerError,
         TowerVersions,
     },

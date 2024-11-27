@@ -16,7 +16,7 @@ use {
             progress_map::{ForkProgress, ProgressMap, PropagatedStats},
             tower_storage::{SavedTower, SavedTowerVersions, TowerStorage},
             BlockhashStatus, ComputedBankState, Stake, SwitchForkDecision, Tower, TowerError,
-            VotedStakes, SWITCH_FORK_THRESHOLD,
+            VotedStakes,
         },
         cost_update_service::CostUpdate,
         repair::{
@@ -91,35 +91,16 @@ use {
 };
 
 pub const MAX_ENTRY_RECV_PER_ITER: usize = 512;
-pub const SUPERMINORITY_THRESHOLD: f64 = 1f64 / 3f64;
 pub const MAX_UNCONFIRMED_SLOTS: usize = 5;
-pub const DUPLICATE_LIVENESS_THRESHOLD: f64 = 0.1;
-pub const DUPLICATE_THRESHOLD: f64 = 1.0 - SWITCH_FORK_THRESHOLD - DUPLICATE_LIVENESS_THRESHOLD;
 
 const MAX_VOTE_SIGNATURES: usize = 200;
 const MAX_VOTE_REFRESH_INTERVAL_MILLIS: usize = 5000;
 const MAX_REPAIR_RETRY_LOOP_ATTEMPTS: usize = 10;
 
-#[derive(PartialEq, Eq, Debug)]
-pub enum HeaviestForkFailures {
-    LockedOut(u64),
-    FailedThreshold(
-        Slot,
-        /* vote depth */ u64,
-        /* Observed stake */ u64,
-        /* Total stake */ u64,
-    ),
-    FailedSwitchThreshold(
-        Slot,
-        /* Observed stake */ u64,
-        /* Total stake */ u64,
-    ),
-    NoPropagatedConfirmation(
-        Slot,
-        /* Observed stake */ u64,
-        /* Total stake */ u64,
-    ),
-}
+pub use crate::consensus::replay_stage::{
+    HeaviestForkFailures, DUPLICATE_LIVENESS_THRESHOLD, DUPLICATE_THRESHOLD,
+    SUPERMINORITY_THRESHOLD,
+};
 
 enum ForkReplayMode {
     Serial,
@@ -1450,36 +1431,21 @@ impl ReplayStage {
         )
     }
 
+    #[inline]
     pub fn initialize_progress_and_fork_choice(
         root_bank: &Bank,
-        mut frozen_banks: Vec<Arc<Bank>>,
+        frozen_banks: Vec<Arc<Bank>>,
         my_pubkey: &Pubkey,
         vote_account: &Pubkey,
         duplicate_slot_hashes: Vec<(Slot, Hash)>,
     ) -> (ProgressMap, HeaviestSubtreeForkChoice) {
-        let mut progress = ProgressMap::default();
-
-        frozen_banks.sort_by_key(|bank| bank.slot());
-
-        // Initialize progress map with any root banks
-        for bank in &frozen_banks {
-            let prev_leader_slot = progress.get_bank_prev_leader_slot(bank);
-            progress.insert(
-                bank.slot(),
-                ForkProgress::new_from_bank(bank, my_pubkey, vote_account, prev_leader_slot, 0, 0),
-            );
-        }
-        let root = root_bank.slot();
-        let mut heaviest_subtree_fork_choice = HeaviestSubtreeForkChoice::new_from_frozen_banks(
-            (root, root_bank.hash()),
-            &frozen_banks,
-        );
-
-        for slot_hash in duplicate_slot_hashes {
-            heaviest_subtree_fork_choice.mark_fork_invalid_candidate(&slot_hash);
-        }
-
-        (progress, heaviest_subtree_fork_choice)
+        crate::consensus::replay_stage::initialize_progress_and_fork_choice(
+            root_bank,
+            frozen_banks,
+            my_pubkey,
+            vote_account,
+            duplicate_slot_hashes,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
