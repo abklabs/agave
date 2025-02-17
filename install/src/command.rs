@@ -10,14 +10,14 @@ use {
     indicatif::{ProgressBar, ProgressStyle},
     serde_derive::{Deserialize, Serialize},
     solana_config_program::{config_instruction, get_config_data, ConfigState},
+    solana_hash::Hash,
+    solana_keypair::{read_keypair_file, signable::Signable, Keypair},
+    solana_message::Message,
+    solana_pubkey::Pubkey,
     solana_rpc_client::rpc_client::RpcClient,
-    solana_sdk::{
-        hash::{Hash, Hasher},
-        message::Message,
-        pubkey::Pubkey,
-        signature::{read_keypair_file, Keypair, Signable, Signer},
-        transaction::Transaction,
-    },
+    solana_sha256_hasher::Hasher,
+    solana_signer::Signer,
+    solana_transaction::Transaction,
     std::{
         fs::{self, File},
         io::{self, BufReader, Read},
@@ -130,9 +130,8 @@ fn download_to_temp(
 
     impl<R: Read> Read for DownloadProgress<R> {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            self.response.read(buf).map(|n| {
+            self.response.read(buf).inspect(|&n| {
                 self.progress_bar.inc(n as u64);
-                n
             })
         }
     }
@@ -425,7 +424,7 @@ fn add_to_path(new_path: &str) -> bool {
                 HWND_BROADCAST,
                 WM_SETTINGCHANGE,
                 0_usize,
-                "Environment\0".as_ptr() as LPARAM,
+                c"Environment".as_ptr() as LPARAM,
                 SMTO_ABORTIFHUNG,
                 5000,
                 ptr::null_mut(),
@@ -508,7 +507,7 @@ fn add_to_path(new_path: &str) -> bool {
                         Ok(())
                     }
                     append_file(&rcfile, &shell_export_string).unwrap_or_else(|err| {
-                        format!("Unable to append to {rcfile:?}: {err}");
+                        println!("Unable to append to {rcfile:?}: {err}");
                     });
                     modified_rcfiles = true;
                 }

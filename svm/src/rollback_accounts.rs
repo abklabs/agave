@@ -1,10 +1,8 @@
 use {
     crate::nonce_info::NonceInfo,
-    solana_sdk::{
-        account::{AccountSharedData, ReadableAccount, WritableAccount},
-        clock::Epoch,
-        pubkey::Pubkey,
-    },
+    solana_account::{AccountSharedData, ReadableAccount, WritableAccount},
+    solana_clock::Epoch,
+    solana_pubkey::Pubkey,
 };
 
 /// Captured account state used to rollback account state for nonce and fee
@@ -33,7 +31,7 @@ impl Default for RollbackAccounts {
 }
 
 impl RollbackAccounts {
-    pub fn new(
+    pub(crate) fn new(
         nonce: Option<NonceInfo>,
         fee_payer_address: Pubkey,
         mut fee_payer_account: AccountSharedData,
@@ -51,6 +49,12 @@ impl RollbackAccounts {
 
         if let Some(nonce) = nonce {
             if &fee_payer_address == nonce.address() {
+                // `nonce` contains an AccountSharedData which has already been advanced to the current DurableNonce
+                // `fee_payer_account` is an AccountSharedData as it currently exists on-chain
+                // thus if the nonce account is being used as the fee payer, we need to update that data here
+                // so we capture both the data change for the nonce and the lamports/rent epoch change for the fee payer
+                fee_payer_account.set_data_from_slice(nonce.account().data());
+
                 RollbackAccounts::SameNonceAndFeePayer {
                     nonce: NonceInfo::new(fee_payer_address, fee_payer_account),
                 }
@@ -63,7 +67,7 @@ impl RollbackAccounts {
         } else {
             // When rolling back failed transactions which don't use nonces, the
             // runtime should not update the fee payer's rent epoch so reset the
-            // rollback fee payer acocunt's rent epoch to its originally loaded
+            // rollback fee payer account's rent epoch to its originally loaded
             // rent epoch value. In the future, a feature gate could be used to
             // alter this behavior such that rent epoch updates are handled the
             // same for both nonce and non-nonce failed transactions.
@@ -79,20 +83,35 @@ impl RollbackAccounts {
             Self::SeparateNonceAndFeePayer { .. } => 2,
         }
     }
+
+    /// Size of accounts tracked for rollback, used when calculating the actual
+    /// cost of transaction processing in the cost model.
+    pub fn data_size(&self) -> usize {
+        match self {
+            Self::FeePayerOnly { fee_payer_account } => fee_payer_account.data().len(),
+            Self::SameNonceAndFeePayer { nonce } => nonce.account().data().len(),
+            Self::SeparateNonceAndFeePayer {
+                nonce,
+                fee_payer_account,
+            } => fee_payer_account
+                .data()
+                .len()
+                .saturating_add(nonce.account().data().len()),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use {
         super::*,
-        solana_sdk::{
-            account::{ReadableAccount, WritableAccount},
-            hash::Hash,
-            nonce::state::{
-                Data as NonceData, DurableNonce, State as NonceState, Versions as NonceVersions,
-            },
-            system_program,
+        solana_account::{ReadableAccount, WritableAccount},
+        solana_hash::Hash,
+        solana_nonce::{
+            state::{Data as NonceData, DurableNonce, State as NonceState},
+            versions::Versions as NonceVersions,
         },
+        solana_sdk_ids::system_program,
     };
 
     #[test]

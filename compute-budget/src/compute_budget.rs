@@ -1,6 +1,8 @@
 use crate::compute_budget_limits::{self, ComputeBudgetLimits, DEFAULT_HEAP_COST};
+#[cfg(feature = "dev-context-only-utils")]
+use qualifier_attr::qualifiers;
 
-#[cfg(all(RUSTC_WITH_SPECIALIZATION, feature = "frozen-abi"))]
+#[cfg(feature = "frozen-abi")]
 impl ::solana_frozen_abi::abi_example::AbiExample for ComputeBudget {
     fn example() -> Self {
         // ComputeBudget is not Serialize so just rely on Default.
@@ -103,8 +105,12 @@ pub struct ComputeBudget {
     /// + alt_bn128_pairing_one_pair_cost_other * (num_elems - 1)
     pub alt_bn128_pairing_one_pair_cost_first: u64,
     pub alt_bn128_pairing_one_pair_cost_other: u64,
-    /// Big integer modular exponentiation cost
-    pub big_modular_exponentiation_cost: u64,
+    /// Big integer modular exponentiation base cost
+    pub big_modular_exponentiation_base_cost: u64,
+    /// Big integer moduler exponentiation cost divisor
+    /// The modular exponentiation cost is computed as
+    /// `input_length`/`big_modular_exponentiation_cost_divisor` + `big_modular_exponentiation_base_cost`
+    pub big_modular_exponentiation_cost_divisor: u64,
     /// Coefficient `a` of the quadratic function which determines the number
     /// of compute units consumed to call poseidon syscall for a given number
     /// of inputs.
@@ -142,7 +148,8 @@ impl From<ComputeBudgetLimits> for ComputeBudget {
 }
 
 impl ComputeBudget {
-    pub fn new(compute_unit_limit: u64) -> Self {
+    #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
+    fn new(compute_unit_limit: u64) -> Self {
         ComputeBudget {
             compute_unit_limit,
             log_64_units: 100,
@@ -173,14 +180,15 @@ impl ComputeBudget {
             curve25519_ristretto_multiply_cost: 2_208,
             curve25519_ristretto_msm_base_cost: 2303,
             curve25519_ristretto_msm_incremental_cost: 788,
-            heap_size: u32::try_from(solana_sdk::entrypoint::HEAP_LENGTH).unwrap(),
+            heap_size: u32::try_from(solana_program_entrypoint::HEAP_LENGTH).unwrap(),
             heap_cost: DEFAULT_HEAP_COST,
             mem_op_base_cost: 10,
             alt_bn128_addition_cost: 334,
             alt_bn128_multiplication_cost: 3_840,
             alt_bn128_pairing_one_pair_cost_first: 36_364,
             alt_bn128_pairing_one_pair_cost_other: 12_121,
-            big_modular_exponentiation_cost: 33,
+            big_modular_exponentiation_base_cost: 190,
+            big_modular_exponentiation_cost_divisor: 2,
             poseidon_cost_coefficient_a: 61,
             poseidon_cost_coefficient_c: 542,
             get_remaining_compute_units_cost: 100,

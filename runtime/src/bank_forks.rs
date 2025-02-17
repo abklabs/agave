@@ -3,7 +3,8 @@
 use {
     crate::{
         accounts_background_service::{AbsRequestSender, SnapshotRequest, SnapshotRequestKind},
-        bank::{epoch_accounts_hash_utils, Bank, SquashTiming},
+        bank::{bank_hash_details, epoch_accounts_hash_utils, Bank, SquashTiming},
+        bank_hash_cache::DumpedSlotSubscription,
         installed_scheduler_pool::{
             BankWithScheduler, InstalledSchedulerPoolArc, SchedulingContext,
         },
@@ -14,10 +15,10 @@ use {
     solana_measure::measure::Measure,
     solana_program_runtime::loaded_programs::{BlockRelation, ForkGraph},
     solana_sdk::{
-        clock::{Epoch, Slot},
+        clock::{BankId, Slot},
         hash::Hash,
-        timing,
     },
+    solana_unified_scheduler_logic::SchedulingMode,
     std::{
         collections::{hash_map::Entry, HashMap, HashSet},
         ops::Index,
@@ -32,6 +33,7 @@ use {
 
 pub const MAX_ROOT_DISTANCE_FOR_VOTE_ONLY: Slot = 400;
 pub type AtomicSlot = AtomicU64;
+#[derive(Clone)]
 pub struct ReadOnlyAtomicSlot {
     slot: Arc<AtomicSlot>,
 }
@@ -82,6 +84,8 @@ pub struct BankForks {
     in_vote_only_mode: Arc<AtomicBool>,
     highest_slot_at_startup: Slot,
     scheduler_pool: Option<InstalledSchedulerPoolArc>,
+
+    dumped_slot_subscribers: Vec<DumpedSlotSubscription>,
 }
 
 impl Index<u64> for BankForks {
@@ -132,6 +136,7 @@ impl BankForks {
             in_vote_only_mode: Arc::new(AtomicBool::new(false)),
             highest_slot_at_startup: 0,
             scheduler_pool: None,
+            dumped_slot_subscribers: vec![],
         }));
 
         root_bank.set_fork_graph_in_program_cache(Arc::downgrade(&bank_forks));
@@ -223,14 +228,22 @@ impl BankForks {
         );
     }
 
-    pub fn insert(&mut self, mut bank: Bank) -> BankWithScheduler {
+    pub fn insert(&mut self, bank: Bank) -> BankWithScheduler {
+        self.insert_with_scheduling_mode(SchedulingMode::BlockVerification, bank)
+    }
+
+    pub fn insert_with_scheduling_mode(
+        &mut self,
+        mode: SchedulingMode,
+        mut bank: Bank,
+    ) -> BankWithScheduler {
         if self.root.load(Ordering::Relaxed) < self.highest_slot_at_startup {
             bank.set_check_program_modification_slot(true);
         }
 
         let bank = Arc::new(bank);
         let bank = if let Some(scheduler_pool) = &self.scheduler_pool {
-            let context = SchedulingContext::new(bank.clone());
+            let context = SchedulingContext::new_with_mode(mode, bank.clone());
             let scheduler = scheduler_pool.take_scheduler(context);
             let bank_with_scheduler = BankWithScheduler::new(bank, Some(scheduler));
             scheduler_pool.register_timeout_listener(bank_with_scheduler.create_timeout_listener());
@@ -281,8 +294,43 @@ impl BankForks {
         self[self.highest_slot()].clone()
     }
 
-    pub fn working_bank_with_scheduler(&self) -> &BankWithScheduler {
-        &self.banks[&self.highest_slot()]
+    pub fn working_bank_with_scheduler(&self) -> BankWithScheduler {
+        self.banks[&self.highest_slot()].clone_with_scheduler()
+    }
+
+    /// Register to be notified when a bank has been dumped (due to duplicate block handling)
+    /// from bank_forks.
+    pub fn register_dumped_slot_subscriber(&mut self, notifier: DumpedSlotSubscription) {
+        self.dumped_slot_subscribers.push(notifier);
+    }
+
+    /// Clears associated banks from BankForks and notifies subscribers that a dump has occured.
+    pub fn dump_slots<'a, I>(&mut self, slots: I) -> (Vec<(Slot, BankId)>, Vec<BankWithScheduler>)
+    where
+        I: Iterator<Item = &'a Slot>,
+    {
+        // Notify subscribers. It is fine that the lock is immediately released, since the bank_forks
+        // lock is held until the end of this function, so subscribers will not be able to interact
+        // with bank_forks anyway.
+        for subscriber in &self.dumped_slot_subscribers {
+            let mut lock = subscriber.lock().unwrap();
+            *lock = true;
+        }
+
+        slots
+            .map(|slot| {
+                // Clear the banks from BankForks
+                let bank = self
+                    .remove(*slot)
+                    .expect("BankForks should not have been purged yet");
+                bank_hash_details::write_bank_hash_details_file(&bank)
+                    .map_err(|err| {
+                        warn!("Unable to write bank hash details file: {err}");
+                    })
+                    .ok();
+                ((*slot, bank.bank_id()), bank)
+            })
+            .unzip()
     }
 
     /// Sends an EpochAccountsHash request if one of the `banks` crosses the EAH boundary.
@@ -494,7 +542,7 @@ impl BankForks {
             "bank-forks_set_root",
             (
                 "elapsed_ms",
-                timing::duration_as_ms(&set_root_start.elapsed()) as usize,
+                set_root_start.elapsed().as_millis() as usize,
                 i64
             ),
             ("slot", root, i64),
@@ -569,7 +617,7 @@ impl BankForks {
             ),
             (
                 "program_cache_prune_ms",
-                timing::duration_as_ms(&program_cache_prune_start.elapsed()),
+                program_cache_prune_start.elapsed().as_millis() as i64,
                 i64
             ),
             ("dropped_banks_len", set_root_metrics.dropped_banks_len, i64),
@@ -721,10 +769,6 @@ impl ForkGraph for BankForks {
                     .unwrap_or(BlockRelation::Unrelated)
             })
             .unwrap_or(BlockRelation::Unknown)
-    }
-
-    fn slot_epoch(&self, slot: Slot) -> Option<Epoch> {
-        self.banks.get(&slot).map(|bank| bank.epoch())
     }
 }
 

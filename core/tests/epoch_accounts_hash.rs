@@ -5,14 +5,12 @@ use {
     crate::snapshot_utils::create_tmp_accounts_dir_for_tests,
     log::*,
     solana_accounts_db::{
-        accounts_db::{AccountShrinkThreshold, CalcAccountsHashDataSource},
-        accounts_hash::CalcAccountsHashConfig,
-        accounts_index::AccountSecondaryIndexes,
+        accounts_db::CalcAccountsHashDataSource, accounts_hash::CalcAccountsHashConfig,
         epoch_accounts_hash::EpochAccountsHash,
     },
     solana_core::{
         accounts_hash_verifier::AccountsHashVerifier,
-        snapshot_packager_service::SnapshotPackagerService,
+        snapshot_packager_service::{PendingSnapshotPackages, SnapshotPackagerService},
     },
     solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfo},
     solana_runtime::{
@@ -32,6 +30,7 @@ use {
     solana_sdk::{
         clock::Slot,
         epoch_schedule::EpochSchedule,
+        feature_set,
         native_token::LAMPORTS_PER_SOL,
         pubkey::Pubkey,
         signature::{Keypair, Signer},
@@ -43,7 +42,7 @@ use {
         mem::ManuallyDrop,
         sync::{
             atomic::{AtomicBool, Ordering},
-            Arc, RwLock,
+            Arc, Mutex, RwLock,
         },
         time::Duration,
     },
@@ -104,6 +103,13 @@ impl TestEnvironment {
         );
         genesis_config_info.genesis_config.epoch_schedule =
             EpochSchedule::custom(Self::SLOTS_PER_EPOCH, Self::SLOTS_PER_EPOCH, false);
+        // When the accounts lt hash feature is enabled, the EAH is *disabled*.
+        // Disable the accounts lt hash feature by removing its account from genesis.
+        genesis_config_info
+            .genesis_config
+            .accounts
+            .remove(&feature_set::accounts_lt_hash::id())
+            .unwrap();
         let snapshot_config = SnapshotConfig {
             full_snapshot_archives_dir: full_snapshot_archives_dir.path().to_path_buf(),
             incremental_snapshot_archives_dir: incremental_snapshot_archives_dir
@@ -180,10 +186,9 @@ impl BackgroundServices {
     ) -> Self {
         info!("Starting background services...");
 
-        let (snapshot_package_sender, snapshot_package_receiver) = crossbeam_channel::unbounded();
+        let pending_snapshot_packages = Arc::new(Mutex::new(PendingSnapshotPackages::default()));
         let snapshot_packager_service = SnapshotPackagerService::new(
-            snapshot_package_sender.clone(),
-            snapshot_package_receiver,
+            pending_snapshot_packages.clone(),
             None,
             exit.clone(),
             cluster_info.clone(),
@@ -195,7 +200,7 @@ impl BackgroundServices {
         let accounts_hash_verifier = AccountsHashVerifier::new(
             accounts_package_sender.clone(),
             accounts_package_receiver,
-            Some(snapshot_package_sender),
+            pending_snapshot_packages,
             exit.clone(),
             snapshot_config.clone(),
         );
@@ -457,9 +462,7 @@ fn test_snapshots_have_expected_epoch_accounts_hash() {
                 &RuntimeConfig::default(),
                 None,
                 None,
-                AccountSecondaryIndexes::default(),
                 None,
-                AccountShrinkThreshold::default(),
                 true,
                 true,
                 false,

@@ -133,34 +133,33 @@ pub trait TransactionProcessingCallback {
     fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<AccountSharedData>;
 
     fn add_builtin_account(&self, _name: &str, _program_id: &Pubkey) {}
+
+    fn get_current_epoch_vote_account_stake(&self, _vote_address: &Pubkey) -> u64;
 }
 ```
 
 Consumers can customize this plug-in to use their own Solana account source,
 caching, and more.
 
-### `SanitizedTransaction`
+### `SVMTransaction`
 
-A "sanitized" Solana transaction is a transaction that has undergone the
+An SVM transaction is a transaction that has undergone the
 various checks required to evaluate a transaction against the Solana protocol
 ruleset. Some of these rules include signature verification and validation
 of account indices (`num_readonly_signers`, etc.).
 
-A `SanitizedTransaction` contains:
+A `SVMTransaction` is a trait that can access:
 
-- `SanitizedMessage`: Enum with two kinds of messages - `LegacyMessage` and
-  `LoadedMessage` - both of which contain:
-    - `MessageHeader`: Vector of `Pubkey` of accounts used in the transaction.
-    - `Hash` of recent block.
-    - Vector of `CompiledInstruction`.
-    - In addition, `LoadedMessage` contains a vector of
-      `MessageAddressTableLookup` - list of address table lookups to
-      load additional accounts for this transaction.
-- A Hash of the message
-- A boolean flag `is_simple_vote_tx` - shortcut for determining if the
-  transaction is merely a simple vote transaction produced by a validator.
-- A vector of `Signature` - the hash of the transaction message encrypted using
+- `signatures`: the hash of the transaction message encrypted using
   the signing key (for each signer in the transaction).
+- `static_account_keys`: Slice of `Pubkey` of accounts used in the transaction.
+- `account_keys`: Pubkeys of all accounts used in the transaction, including
+  those from address table lookups.
+- `recent_blockhash`: Hash of a recent block.
+- `instructions_iter`: An iterator over the transaction's instructions.
+- `message_address_table_lookups`: An iterator over the transaction's
+  address table lookups. These are only used in V0 transactions, for legacy
+  transactions the iterator is empty.
 
 ### `TransactionCheckResult`
 
@@ -174,9 +173,8 @@ The transaction processor requires consumers to provide values describing
 the runtime environment to use for processing transactions.
 
 - `blockhash`: The blockhash to use for the transaction batch.
-- `epoch_total_stake`: The total stake for the current epoch.
-- `epoch_vote_accounts`: The vote accounts for the current epoch.
 - `feature_set`: Runtime feature set to use for the transaction batch.
+- `epoch_total_stake`: The total stake for the current epoch.
 - `fee_structure`: Fee structure to use for assessing transaction fees.
 - `lamports_per_signature`: Lamports per signature to charge per transaction.
 - `rent_collector`: Rent collector to use for the transaction batch.
@@ -206,9 +204,9 @@ The output of the transaction batch processor's
 
 - `error_metrics`: Error metrics for transactions that were processed.
 - `execute_timings`: Timings for transaction batch execution.
-- `execution_results`: Vector of results indicating whether a transaction was
-  executed or could not be executed. Note executed transactions can still have
-  failed!
+- `processing_results`: Vector of results indicating whether a transaction was
+  processed or could not be processed for some reason. Note that processed
+  transactions can still have failed!
 
 # Functional Model
 
@@ -245,10 +243,10 @@ Steps of `load_and_execute_sanitized_transactions`
         - Return the replenished local program cache.
 
 2. Load accounts (call to `load_accounts` function)
-   - For each `SanitizedTransaction` and `TransactionCheckResult`, we:
+   - For each `SVMTransaction` and `TransactionCheckResult`, we:
         - Calculate the number of signatures in transaction and its cost.
         - Call `load_transaction_accounts`
-            - The function is interwined with the struct `CompiledInstruction`
+            - The function is interwined with the struct `SVMInstruction`
             - Load accounts from accounts DB
             - Extract data from accounts
             - Verify if we've reached the maximum account data size
@@ -280,7 +278,7 @@ Steps of `load_and_execute_sanitized_transactions`
       the clone of environments of `programs_loaded_for_tx_batch`
          - `programs_loaded_for_tx_batch` contains a reference to all the `ProgramCacheEntry`s
             necessary for the transaction. It maintains an `Arc` to the programs in the global
-            `ProgramCacheEntrys` data structure.
+            `ProgramCacheEntry` data structure.
       6. Call `MessageProcessor::process_message` to execute the
       transaction. `MessageProcessor` is contained in
       solana-program-runtime crate. The result of processing message

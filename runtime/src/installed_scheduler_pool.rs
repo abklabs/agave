@@ -23,12 +23,14 @@
 use {
     crate::bank::Bank,
     log::*,
+    solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
     solana_sdk::{
         clock::Slot,
         hash::Hash,
         transaction::{Result, SanitizedTransaction, TransactionError},
     },
     solana_timings::ExecuteTimings,
+    solana_unified_scheduler_logic::SchedulingMode,
     std::{
         fmt::{self, Debug},
         mem,
@@ -45,6 +47,8 @@ pub fn initialized_result_with_timings() -> ResultWithTimings {
 }
 
 pub trait InstalledSchedulerPool: Send + Sync + Debug {
+    /// A very thin wrapper of [`Self::take_resumed_scheduler`] to take a scheduler from this pool
+    /// for a brand-new bank.
     fn take_scheduler(&self, context: SchedulingContext) -> InstalledSchedulerBox {
         self.take_resumed_scheduler(context, initialized_result_with_timings())
     }
@@ -55,6 +59,13 @@ pub trait InstalledSchedulerPool: Send + Sync + Debug {
         result_with_timings: ResultWithTimings,
     ) -> InstalledSchedulerBox;
 
+    /// Registers an opaque timeout listener.
+    ///
+    /// This method and the passed `struct` called [`TimeoutListener`] are very opaque by purpose.
+    /// Specifically, it doesn't provide any way to tell which listener is semantically associated
+    /// to which particular scheduler. That's because proper _unregistration_ is omitted at the
+    /// timing of scheduler returning to reduce latency of the normal block-verification code-path,
+    /// relying on eventual stale listener clean-up by `solScCleaner`.
     fn register_timeout_listener(&self, timeout_listener: TimeoutListener);
 }
 
@@ -94,23 +105,23 @@ impl Debug for TimeoutListener {
 /// graph TD
 ///     Bank["Arc#lt;Bank#gt;"]
 ///
-///     subgraph solana-runtime
+///     subgraph solana-runtime[<span style="font-size: 70%">solana-runtime</span>]
 ///         BankForks;
 ///         BankWithScheduler;
 ///         Bank;
-///         LoadExecuteAndCommitTransactions(["load_execute_and_commit_transactions()"]);
+///         LoadExecuteAndCommitTransactions([<span style="font-size: 67%">load_execute_and_commit_transactions#lpar;#rpar;</span>]);
 ///         SchedulingContext;
 ///         InstalledSchedulerPool{{InstalledSchedulerPool}};
 ///         InstalledScheduler{{InstalledScheduler}};
 ///     end
 ///
-///     subgraph solana-unified-scheduler-pool
+///     subgraph solana-unified-scheduler-pool[<span style="font-size: 70%">solana-unified-scheduler-pool</span>]
 ///         SchedulerPool;
 ///         PooledScheduler;
 ///         ScheduleExecution(["schedule_execution()"]);
 ///     end
 ///
-///     subgraph solana-ledger
+///     subgraph solana-ledger[<span style="font-size: 60%">solana-ledger</span>]
 ///         ExecuteBatch(["execute_batch()"]);
 ///     end
 ///
@@ -134,11 +145,7 @@ impl Debug for TimeoutListener {
 #[cfg_attr(feature = "dev-context-only-utils", automock)]
 // suppress false clippy complaints arising from mockall-derive:
 //   warning: `#[must_use]` has no effect when applied to a struct field
-//   warning: the following explicit lifetimes could be elided: 'a
-#[cfg_attr(
-    feature = "dev-context-only-utils",
-    allow(unused_attributes, clippy::needless_lifetimes)
-)]
+#[cfg_attr(feature = "dev-context-only-utils", allow(unused_attributes))]
 pub trait InstalledScheduler: Send + Sync + Debug + 'static {
     fn id(&self) -> SchedulerId;
     fn context(&self) -> &SchedulingContext;
@@ -165,9 +172,10 @@ pub trait InstalledScheduler: Send + Sync + Debug + 'static {
     /// optimize the fast code-path of normal transaction scheduling to be multi-threaded at the
     /// cost of far slower error code-path while giving implementors increased flexibility by
     /// having &mut.
-    fn schedule_execution<'a>(
-        &'a self,
-        transaction_with_index: &'a (&'a SanitizedTransaction, usize),
+    fn schedule_execution(
+        &self,
+        transaction: RuntimeTransaction<SanitizedTransaction>,
+        index: usize,
     ) -> ScheduleResult;
 
     /// Return the error which caused the scheduler to abort.
@@ -229,13 +237,33 @@ pub type SchedulerId = u64;
 /// `SchedulingContext`s.
 #[derive(Clone, Debug)]
 pub struct SchedulingContext {
-    // mode: SchedulingMode, // this will be added later.
+    mode: SchedulingMode,
     bank: Arc<Bank>,
 }
 
 impl SchedulingContext {
     pub fn new(bank: Arc<Bank>) -> Self {
-        Self { bank }
+        // mode will be configurable later
+        Self {
+            mode: SchedulingMode::BlockVerification,
+            bank,
+        }
+    }
+
+    pub fn new_with_mode(mode: SchedulingMode, bank: Arc<Bank>) -> Self {
+        Self { mode, bank }
+    }
+
+    #[cfg(feature = "dev-context-only-utils")]
+    pub fn for_production(bank: Arc<Bank>) -> Self {
+        Self {
+            mode: SchedulingMode::BlockProduction,
+            bank,
+        }
+    }
+
+    pub fn mode(&self) -> SchedulingMode {
+        self.mode
     }
 
     pub fn bank(&self) -> &Arc<Bank> {
@@ -291,18 +319,24 @@ impl WaitReason {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum SchedulerStatus {
-    /// Unified scheduler is disabled or installed scheduler is consumed by wait_for_termination().
-    /// Note that transition to Unavailable from {Active, Stale} is one-way (i.e. one-time).
-    /// Also, this variant is transiently used as a placeholder internally when transitioning
-    /// scheduler statuses, which isn't observable unless panic is happening.
+    /// Unified scheduler is disabled or installed scheduler is consumed by
+    /// [`InstalledScheduler::wait_for_termination`]. Note that transition to [`Self::Unavailable`]
+    /// from {[`Self::Active`], [`Self::Stale`]} is one-way (i.e. one-time) unlike [`Self::Active`]
+    /// <=> [`Self::Stale`] below.  Also, this variant is transiently used as a placeholder
+    /// internally when transitioning scheduler statuses, which isn't observable unless panic is
+    /// happening.
     Unavailable,
-    /// Scheduler is installed into a bank; could be running or just be idling.
-    /// This will be transitioned to Stale after certain time has passed if its bank hasn't been
-    /// frozen.
+    /// Scheduler is installed into a bank; could be running or just be waiting for additional
+    /// transactions. This will be transitioned to [`Self::Stale`] after certain time (i.e.
+    /// `solana_unified_scheduler_pool::DEFAULT_TIMEOUT_DURATION`) has passed if its bank hasn't
+    /// been frozen since installed.
     Active(InstalledSchedulerBox),
-    /// Scheduler is idling for long time, returning scheduler back to the pool.
-    /// This will be immediately (i.e. transaparently) transitioned to Active as soon as there's
-    /// new transaction to be executed.
+    /// Scheduler has yet to freeze its associated bank even after it's taken too long since
+    /// installed, resulting in returning the scheduler back to the pool. Later, this can
+    /// immediately (i.e. transparently) be transitioned to [`Self::Active`] as soon as there's new
+    /// transaction to be executed (= [`BankWithScheduler::schedule_transaction_executions`] is
+    /// called, which internally calls [`BankWithSchedulerInner::with_active_scheduler`] to make
+    /// the transition happen).
     Stale(InstalledSchedulerPoolArc, ResultWithTimings),
 }
 
@@ -444,10 +478,11 @@ impl BankWithScheduler {
     ///
     /// Calling this will panic if the installed scheduler is Unavailable (the bank is
     /// wait_for_termination()-ed or the unified scheduler is disabled in the first place).
-    // 'a is needed; anonymous_lifetime_in_impl_trait isn't stabilized yet...
-    pub fn schedule_transaction_executions<'a>(
+    pub fn schedule_transaction_executions(
         &self,
-        transactions_with_indexes: impl ExactSizeIterator<Item = (&'a SanitizedTransaction, &'a usize)>,
+        transactions_with_indexes: impl ExactSizeIterator<
+            Item = (RuntimeTransaction<SanitizedTransaction>, usize),
+        >,
     ) -> Result<()> {
         trace!(
             "schedule_transaction_executions(): {} txs",
@@ -455,8 +490,8 @@ impl BankWithScheduler {
         );
 
         let schedule_result: ScheduleResult = self.inner.with_active_scheduler(|scheduler| {
-            for (sanitized_transaction, &index) in transactions_with_indexes {
-                scheduler.schedule_execution(&(sanitized_transaction, index))?;
+            for (sanitized_transaction, index) in transactions_with_indexes {
+                scheduler.schedule_execution(sanitized_transaction, index)?;
             }
             Ok(())
         });
@@ -565,17 +600,26 @@ impl BankWithSchedulerInner {
         let weak_bank = Arc::downgrade(self);
         TimeoutListener::new(move |pool| {
             let Some(bank) = weak_bank.upgrade() else {
+                // BankWithSchedulerInner is already dropped, indicating successful and timely
+                // `wait_for_termination()` on the bank prior to this triggering of the timeout,
+                // rendering this callback invocation no-op.
                 return;
             };
 
             let Ok(mut scheduler) = bank.scheduler.write() else {
+                // BankWithScheduler's lock is poisoned...
                 return;
             };
 
+            // Reaching here means that it's been awhile since this active scheduler is taken from
+            // the pool and yet it has yet to be `wait_for_termination()`-ed. To avoid unbounded
+            // thread creation under forky condition, return the scheduler for now, even if the
+            // bank could process more transactions later.
             scheduler.maybe_transition_from_active_to_stale(|scheduler| {
-                // The scheduler hasn't still been wait_for_termination()-ed after awhile...
                 // Return the installed scheduler back to the scheduler pool as soon as the
-                // scheduler gets idle after executing all currently-scheduled transactions.
+                // scheduler indicates the completion of all currently-scheduled transaction
+                // executions by `solana_unified_scheduler_pool::ThreadManager::end_session()`
+                // internally.
 
                 let id = scheduler.id();
                 let (result_with_timings, uninstalled_scheduler) =
@@ -841,9 +885,9 @@ mod tests {
             mint_keypair,
             ..
         } = create_genesis_config(10_000);
-        let tx0 = SanitizedTransaction::from_transaction_for_tests(system_transaction::transfer(
+        let tx0 = RuntimeTransaction::from_transaction_for_tests(system_transaction::transfer(
             &mint_keypair,
-            &solana_sdk::pubkey::new_rand(),
+            &solana_pubkey::new_rand(),
             2,
             genesis_config.hash(),
         ));
@@ -856,12 +900,12 @@ mod tests {
                     mocked
                         .expect_schedule_execution()
                         .times(1)
-                        .returning(|(_, _)| Ok(()));
+                        .returning(|_, _| Ok(()));
                 } else {
                     mocked
                         .expect_schedule_execution()
                         .times(1)
-                        .returning(|(_, _)| Err(SchedulerAborted));
+                        .returning(|_, _| Err(SchedulerAborted));
                     mocked
                         .expect_recover_error_after_abort()
                         .times(1)
@@ -871,7 +915,7 @@ mod tests {
         );
 
         let bank = BankWithScheduler::new(bank, Some(mocked_scheduler));
-        let result = bank.schedule_transaction_executions([(&tx0, &0)].into_iter());
+        let result = bank.schedule_transaction_executions([(tx0, 0)].into_iter());
         if should_succeed {
             assert_matches!(result, Ok(()));
         } else {

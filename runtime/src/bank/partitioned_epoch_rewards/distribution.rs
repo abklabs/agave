@@ -231,19 +231,21 @@ impl Bank {
 mod tests {
     use {
         super::*,
-        crate::bank::{
-            partitioned_epoch_rewards::{
-                epoch_rewards_hasher::hash_rewards_into_partitions, tests::convert_rewards,
-                REWARD_CALCULATION_NUM_BLOCKS,
+        crate::{
+            bank::{
+                partitioned_epoch_rewards::{
+                    epoch_rewards_hasher::hash_rewards_into_partitions, tests::convert_rewards,
+                    REWARD_CALCULATION_NUM_BLOCKS,
+                },
+                tests::create_genesis_config,
             },
-            tests::create_genesis_config,
+            inflation_rewards::points::PointValue,
         },
         rand::Rng,
         solana_accounts_db::stake_rewards::StakeReward,
         solana_sdk::{
             account::from_account,
             epoch_schedule::EpochSchedule,
-            feature_set,
             hash::Hash,
             native_token::LAMPORTS_PER_SOL,
             rent::Rent,
@@ -270,7 +272,8 @@ mod tests {
             .map(|_| PartitionedStakeReward::new_random())
             .collect::<Vec<_>>();
 
-        let stake_rewards = hash_rewards_into_partitions(stake_rewards, &Hash::new(&[1; 32]), 2);
+        let stake_rewards =
+            hash_rewards_into_partitions(stake_rewards, &Hash::new_from_array([1; 32]), 2);
 
         bank.set_epoch_reward_status_active(
             bank.block_height() + REWARD_CALCULATION_NUM_BLOCKS,
@@ -294,7 +297,7 @@ mod tests {
 
         let stake_rewards = hash_rewards_into_partitions(
             stake_rewards,
-            &Hash::new(&[1; 32]),
+            &Hash::new_from_array([1; 32]),
             bank.epoch_schedule().slots_per_epoch as usize + 1,
         );
 
@@ -348,14 +351,21 @@ mod tests {
         let (mut genesis_config, _mint_keypair) =
             create_genesis_config(1_000_000 * LAMPORTS_PER_SOL);
         genesis_config.epoch_schedule = EpochSchedule::custom(432000, 432000, false);
-        let mut bank = Bank::new_for_tests(&genesis_config);
-        bank.activate_feature(&feature_set::enable_partitioned_epoch_reward::id());
+        let bank = Bank::new_for_tests(&genesis_config);
 
         // Set up epoch_rewards sysvar with rewards with 1e9 lamports to distribute.
         let total_rewards = 1_000_000_000;
         let num_partitions = 2; // num_partitions is arbitrary and unimportant for this test
         let total_points = (total_rewards * 42) as u128; // total_points is arbitrary for the purposes of this test
-        bank.create_epoch_rewards_sysvar(total_rewards, 0, 42, num_partitions, total_points);
+        bank.create_epoch_rewards_sysvar(
+            0,
+            42,
+            num_partitions,
+            PointValue {
+                rewards: total_rewards,
+                points: total_points,
+            },
+        );
         let pre_epoch_rewards_account = bank.get_account(&sysvar::epoch_rewards::id()).unwrap();
         let expected_balance =
             bank.get_minimum_balance_for_rent_exemption(pre_epoch_rewards_account.data().len());
@@ -421,7 +431,7 @@ mod tests {
         let stake_rewards = convert_rewards(stake_rewards);
 
         let stake_rewards_bucket =
-            hash_rewards_into_partitions(stake_rewards, &Hash::new(&[1; 32]), 100);
+            hash_rewards_into_partitions(stake_rewards, &Hash::new_from_array([1; 32]), 100);
         bank.set_epoch_reward_status_active(
             bank.block_height() + REWARD_CALCULATION_NUM_BLOCKS,
             stake_rewards_bucket.clone(),

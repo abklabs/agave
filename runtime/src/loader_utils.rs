@@ -8,7 +8,7 @@ use {
         client::{Client, SyncClient},
         clock::Clock,
         instruction::{AccountMeta, Instruction},
-        loader_instruction,
+        loader_v4,
         message::Message,
         pubkey::Pubkey,
         signature::{Keypair, Signer},
@@ -65,63 +65,6 @@ pub fn create_program(bank: &Bank, loader_id: &Pubkey, name: &str) -> Pubkey {
     program_id
 }
 
-pub fn load_and_finalize_program<T: Client>(
-    bank_client: &T,
-    loader_id: &Pubkey,
-    program_keypair: Option<Keypair>,
-    payer_keypair: &Keypair,
-    name: &str,
-) -> (Keypair, Instruction) {
-    let program = load_program_from_file(name);
-    let program_keypair = program_keypair.unwrap_or_else(|| {
-        let program_keypair = Keypair::new();
-        let instruction = system_instruction::create_account(
-            &payer_keypair.pubkey(),
-            &program_keypair.pubkey(),
-            1.max(
-                bank_client
-                    .get_minimum_balance_for_rent_exemption(program.len())
-                    .unwrap(),
-            ),
-            program.len() as u64,
-            loader_id,
-        );
-        let message = Message::new(&[instruction], Some(&payer_keypair.pubkey()));
-        bank_client
-            .send_and_confirm_message(&[payer_keypair, &program_keypair], message)
-            .unwrap();
-        program_keypair
-    });
-    let chunk_size = CHUNK_SIZE;
-    let mut offset = 0;
-    for chunk in program.chunks(chunk_size) {
-        let instruction =
-            loader_instruction::write(&program_keypair.pubkey(), loader_id, offset, chunk.to_vec());
-        let message = Message::new(&[instruction], Some(&payer_keypair.pubkey()));
-        bank_client
-            .send_and_confirm_message(&[payer_keypair, &program_keypair], message)
-            .unwrap();
-        offset += chunk_size as u32;
-    }
-    let instruction = loader_instruction::finalize(&program_keypair.pubkey(), loader_id);
-    (program_keypair, instruction)
-}
-
-pub fn load_program<T: Client>(
-    bank_client: &T,
-    loader_id: &Pubkey,
-    payer_keypair: &Keypair,
-    name: &str,
-) -> Pubkey {
-    let (program_keypair, instruction) =
-        load_and_finalize_program(bank_client, loader_id, None, payer_keypair, name);
-    let message = Message::new(&[instruction], Some(&payer_keypair.pubkey()));
-    bank_client
-        .send_and_confirm_message(&[payer_keypair, &program_keypair], message)
-        .unwrap();
-    program_keypair.pubkey()
-}
-
 pub fn load_upgradeable_buffer<T: Client>(
     bank_client: &T,
     from_keypair: &Keypair,
@@ -176,6 +119,7 @@ pub fn load_upgradeable_buffer<T: Client>(
     program
 }
 
+#[deprecated(since = "2.2.0", note = "Use load_program_of_loader_v4() instead")]
 pub fn load_upgradeable_program(
     bank_client: &BankClient,
     from_keypair: &Keypair,
@@ -192,6 +136,7 @@ pub fn load_upgradeable_program(
         name,
     );
 
+    #[allow(deprecated)]
     let message = Message::new(
         &bpf_loader_upgradeable::deploy_with_max_program_len(
             &from_keypair.pubkey(),
@@ -222,6 +167,7 @@ pub fn load_upgradeable_program(
     });
 }
 
+#[deprecated(since = "2.2.0", note = "Use load_program_of_loader_v4() instead")]
 pub fn load_upgradeable_program_wrapper(
     bank_client: &BankClient,
     mint_keypair: &Keypair,
@@ -230,6 +176,7 @@ pub fn load_upgradeable_program_wrapper(
 ) -> Pubkey {
     let buffer_keypair = Keypair::new();
     let program_keypair = Keypair::new();
+    #[allow(deprecated)]
     load_upgradeable_program(
         bank_client,
         mint_keypair,
@@ -241,6 +188,7 @@ pub fn load_upgradeable_program_wrapper(
     program_keypair.pubkey()
 }
 
+#[deprecated(since = "2.2.0", note = "Use load_program_of_loader_v4() instead")]
 pub fn load_upgradeable_program_and_advance_slot(
     bank_client: &mut BankClient,
     bank_forks: &RwLock<BankForks>,
@@ -248,6 +196,7 @@ pub fn load_upgradeable_program_and_advance_slot(
     authority_keypair: &Keypair,
     name: &str,
 ) -> (Arc<Bank>, Pubkey) {
+    #[allow(deprecated)]
     let program_id =
         load_upgradeable_program_wrapper(bank_client, mint_keypair, authority_keypair, name);
 
@@ -311,6 +260,93 @@ pub fn set_upgrade_authority<T: Client>(
     bank_client
         .send_and_confirm_message(&[from_keypair, current_authority_keypair], message)
         .unwrap();
+}
+
+pub fn instructions_to_load_program_of_loader_v4<T: Client>(
+    bank_client: &T,
+    payer_keypair: &Keypair,
+    authority_keypair: &Keypair,
+    name: &str,
+    program_keypair: Option<Keypair>,
+    target_program_id: Option<&Pubkey>,
+) -> (Keypair, Vec<Instruction>) {
+    let mut instructions = Vec::new();
+    let loader_id = &loader_v4::id();
+    let program = load_program_from_file(name);
+    let program_keypair = program_keypair.unwrap_or_else(|| {
+        let program_keypair = Keypair::new();
+        instructions.push(system_instruction::create_account(
+            &payer_keypair.pubkey(),
+            &program_keypair.pubkey(),
+            bank_client
+                .get_minimum_balance_for_rent_exemption(
+                    loader_v4::LoaderV4State::program_data_offset().saturating_add(program.len()),
+                )
+                .unwrap(),
+            0,
+            loader_id,
+        ));
+        program_keypair
+    });
+    instructions.push(loader_v4::set_program_length(
+        &program_keypair.pubkey(),
+        &authority_keypair.pubkey(),
+        program.len() as u32,
+        &payer_keypair.pubkey(),
+    ));
+    let chunk_size = CHUNK_SIZE;
+    let mut offset = 0;
+    for chunk in program.chunks(chunk_size) {
+        instructions.push(loader_v4::write(
+            &program_keypair.pubkey(),
+            &authority_keypair.pubkey(),
+            offset,
+            chunk.to_vec(),
+        ));
+        offset += chunk_size as u32;
+    }
+    instructions.push(if let Some(target_program_id) = target_program_id {
+        loader_v4::deploy_from_source(
+            target_program_id,
+            &authority_keypair.pubkey(),
+            &program_keypair.pubkey(),
+        )
+    } else {
+        loader_v4::deploy(&program_keypair.pubkey(), &authority_keypair.pubkey())
+    });
+    (program_keypair, instructions)
+}
+
+pub fn load_program_of_loader_v4(
+    bank_client: &mut BankClient,
+    bank_forks: &RwLock<BankForks>,
+    payer_keypair: &Keypair,
+    authority_keypair: &Keypair,
+    name: &str,
+) -> (Arc<Bank>, Pubkey) {
+    let (program_keypair, instructions) = instructions_to_load_program_of_loader_v4(
+        bank_client,
+        payer_keypair,
+        authority_keypair,
+        name,
+        None,
+        None,
+    );
+    let signers: &[&[&Keypair]] = &[
+        &[payer_keypair, &program_keypair],
+        &[payer_keypair, authority_keypair],
+    ];
+    let signers = std::iter::once(signers[0]).chain(std::iter::repeat(signers[1]));
+    for (instruction, signers) in instructions.into_iter().zip(signers) {
+        let message = Message::new(&[instruction], Some(&payer_keypair.pubkey()));
+        bank_client
+            .send_and_confirm_message(signers, message)
+            .unwrap();
+    }
+    let bank = bank_client
+        .advance_slot(1, bank_forks, &Pubkey::default())
+        .expect("Failed to advance the slot");
+    (bank, program_keypair.pubkey())
 }
 
 // Return an Instruction that invokes `program_id` with `data` and required

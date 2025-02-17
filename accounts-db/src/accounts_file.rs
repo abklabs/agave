@@ -9,7 +9,9 @@ use {
             error::TieredStorageError, hot::HOT_FORMAT, index::IndexOffset, TieredStorage,
         },
     },
-    solana_sdk::{account::AccountSharedData, clock::Slot, pubkey::Pubkey},
+    solana_account::AccountSharedData,
+    solana_clock::Slot,
+    solana_pubkey::Pubkey,
     std::{
         mem,
         path::{Path, PathBuf},
@@ -50,10 +52,11 @@ pub enum MatchAccountOwnerError {
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum StorageAccess {
-    #[default]
     /// storages should be accessed by Mmap
     Mmap,
+    /// storages should be accessed by File I/O
     /// ancient storages are created by 1-shot write to pack multiple accounts together more efficiently with new formats
+    #[default]
     File,
 }
 
@@ -95,6 +98,15 @@ impl AccountsFile {
         match self {
             Self::AppendVec(av) => av.reopen_as_readonly().map(Self::AppendVec),
             Self::TieredStorage(_) => None,
+        }
+    }
+
+    /// Return the total number of bytes of the zero lamport single ref accounts in the storage.
+    /// Those bytes are "dead" and can be shrunk away.
+    pub(crate) fn dead_bytes_due_to_zero_lamport_single_ref(&self, count: usize) -> usize {
+        match self {
+            Self::AppendVec(av) => av.dead_bytes_due_to_zero_lamport_single_ref(count),
+            Self::TieredStorage(ts) => ts.dead_bytes_due_to_zero_lamport_single_ref(count),
         }
     }
 
@@ -210,10 +222,7 @@ impl AccountsFile {
     }
 
     /// Iterate over all accounts and call `callback` with each account.
-    pub(crate) fn scan_accounts(
-        &self,
-        callback: impl for<'local> FnMut(StoredAccountMeta<'local>),
-    ) {
+    pub fn scan_accounts(&self, callback: impl for<'local> FnMut(StoredAccountMeta<'local>)) {
         match self {
             Self::AppendVec(av) => av.scan_accounts(callback),
             Self::TieredStorage(ts) => {

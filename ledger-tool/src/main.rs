@@ -20,7 +20,10 @@ use {
     log::*,
     serde_derive::Serialize,
     solana_account_decoder::UiAccountEncoding,
-    solana_accounts_db::{accounts_db::CalcAccountsHashDataSource, accounts_index::ScanConfig},
+    solana_accounts_db::{
+        accounts_db::CalcAccountsHashDataSource,
+        accounts_index::{ScanConfig, ScanOrder},
+    },
     solana_clap_utils::{
         hidden_unless_forced,
         input_parsers::{cluster_type_of, pubkey_of, pubkeys_of},
@@ -31,12 +34,14 @@ use {
     },
     solana_cli_output::OutputFormat,
     solana_core::{
+        banking_simulation::{BankingSimulator, BankingTraceEvents},
         system_monitor_service::{SystemMonitorService, SystemMonitorStatsReportConfig},
-        validator::BlockVerificationMethod,
+        validator::{BlockProductionMethod, BlockVerificationMethod, TransactionStructure},
     },
     solana_cost_model::{cost_model::CostModel, cost_tracker::CostTracker},
+    solana_feature_set::{self as feature_set, FeatureSet},
     solana_ledger::{
-        blockstore::{create_new_ledger, Blockstore},
+        blockstore::{banking_trace_path, create_new_ledger, Blockstore},
         blockstore_options::{AccessType, LedgerColumnOptions},
         blockstore_processor::{
             ProcessSlotCallback, TransactionStatusMessage, TransactionStatusSender,
@@ -49,6 +54,7 @@ use {
             Bank, RewardCalculationEvent,
         },
         bank_forks::BankForks,
+        inflation_rewards::points::{InflationPointCalculationEvent, PointValue},
         snapshot_archive_info::SnapshotArchiveInfoGetter,
         snapshot_bank_utils,
         snapshot_minimizer::SnapshotMinimizer,
@@ -57,12 +63,12 @@ use {
             SUPPORTED_ARCHIVE_COMPRESSION,
         },
     },
+    solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
     solana_sdk::{
         account::{AccountSharedData, ReadableAccount, WritableAccount},
         account_utils::StateMut,
         clock::{Epoch, Slot},
         feature::{self, Feature},
-        feature_set::{self, FeatureSet},
         genesis_config::ClusterType,
         inflation::Inflation,
         native_token::{lamports_to_sol, sol_to_lamports, Sol},
@@ -72,10 +78,10 @@ use {
         shred_version::compute_shred_version,
         stake::{self, state::StakeStateV2},
         system_program,
-        transaction::{MessageHash, SanitizedTransaction, SimpleAddressLoader},
+        transaction::{MessageHash, SimpleAddressLoader},
     },
-    solana_stake_program::{points::PointValue, stake_state},
-    solana_transaction_status::UiInstruction,
+    solana_stake_program::stake_state,
+    solana_transaction_status::parse_ui_instruction,
     solana_unified_scheduler_pool::DefaultSchedulerPool,
     solana_vote_program::{
         self,
@@ -83,8 +89,8 @@ use {
     },
     std::{
         collections::{HashMap, HashSet},
-        ffi::OsStr,
-        fs::File,
+        ffi::{OsStr, OsString},
+        fs::{read_dir, File},
         io::{self, Write},
         mem::swap,
         path::{Path, PathBuf},
@@ -206,7 +212,6 @@ fn graph_forks(bank_forks: &BankForks, config: &GraphConfig) -> String {
 
     // Search all forks and collect the last vote made by each validator
     let mut last_votes = HashMap::new();
-    let default_vote_state = VoteState::default();
     for fork_slot in &fork_slots {
         let bank = &bank_forks[*fork_slot];
 
@@ -217,7 +222,6 @@ fn graph_forks(bank_forks: &BankForks, config: &GraphConfig) -> String {
             .sum();
         for (stake, vote_account) in bank.vote_accounts().values() {
             let vote_state = vote_account.vote_state();
-            let vote_state = vote_state.unwrap_or(&default_vote_state);
             if let Some(last_vote) = vote_state.votes.iter().last() {
                 let entry = last_votes.entry(vote_state.node_pubkey).or_insert((
                     last_vote.slot(),
@@ -258,7 +262,6 @@ fn graph_forks(bank_forks: &BankForks, config: &GraphConfig) -> String {
         loop {
             for (_, vote_account) in bank.vote_accounts().values() {
                 let vote_state = vote_account.vote_state();
-                let vote_state = vote_state.unwrap_or(&default_vote_state);
                 if let Some(last_vote) = vote_state.votes.iter().last() {
                     let validator_votes = all_votes.entry(vote_state.node_pubkey).or_default();
                     validator_votes
@@ -474,7 +477,7 @@ fn compute_slot_cost(
             .transactions
             .into_iter()
             .filter_map(|transaction| {
-                SanitizedTransaction::try_create(
+                RuntimeTransaction::try_create(
                     transaction,
                     MessageHash::Compute,
                     None,
@@ -539,6 +542,70 @@ fn assert_capitalization(bank: &Bank) {
     assert!(bank.calculate_and_verify_capitalization(debug_verify));
 }
 
+fn load_banking_trace_events_or_exit(ledger_path: &Path) -> BankingTraceEvents {
+    let file_paths = read_banking_trace_event_file_paths_or_exit(banking_trace_path(ledger_path));
+
+    info!("Using: banking trace event files: {file_paths:?}");
+    match BankingTraceEvents::load(&file_paths) {
+        Ok(banking_trace_events) => banking_trace_events,
+        Err(error) => {
+            eprintln!("Failed to load banking trace events: {error:?}");
+            exit(1)
+        }
+    }
+}
+
+fn read_banking_trace_event_file_paths_or_exit(banking_trace_path: PathBuf) -> Vec<PathBuf> {
+    info!("Using: banking trace events dir: {banking_trace_path:?}");
+
+    let entries = match read_dir(&banking_trace_path) {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!("Error: failed to open banking_trace_path: {error:?}");
+            exit(1);
+        }
+    };
+
+    let mut entry_names = entries
+        .flat_map(|entry| entry.ok().map(|entry| entry.file_name()))
+        .collect::<HashSet<OsString>>();
+
+    let mut event_file_paths = vec![];
+
+    if entry_names.is_empty() {
+        warn!("banking_trace_path dir is empty.");
+        return event_file_paths;
+    }
+
+    for index in 0.. {
+        let event_file_name: OsString = BankingSimulator::event_file_name(index).into();
+        if entry_names.remove(&event_file_name) {
+            event_file_paths.push(banking_trace_path.join(event_file_name));
+        } else {
+            break;
+        }
+    }
+
+    if event_file_paths.is_empty() {
+        warn!("Error: no event files found");
+    }
+
+    if !entry_names.is_empty() {
+        let full_names = entry_names
+            .into_iter()
+            .map(|name| banking_trace_path.join(name))
+            .collect::<Vec<_>>();
+        warn!(
+            "Some files in {banking_trace_path:?} is ignored due to gapped events file rotation \
+             or unrecognized names: {full_names:?}"
+        );
+    }
+
+    // Reverse to load in the chronicle order (note that this isn't strictly needed)
+    event_file_paths.reverse();
+    event_file_paths
+}
+
 struct SlotRecorderConfig {
     transaction_recorder: Option<JoinHandle<()>>,
     transaction_status_sender: Option<TransactionStatusSender>,
@@ -571,13 +638,13 @@ fn setup_slot_recording(
                 exit(1);
             });
 
-            let mut include_bank = false;
+            let mut include_bank_hash_components = false;
             let mut include_tx = false;
             if let Some(args) = arg_matches.values_of("record_slots_config") {
                 for arg in args {
                     match arg {
                         "tx" => include_tx = true,
-                        "accounts" => include_bank = true,
+                        "accounts" => include_bank_hash_components = true,
                         _ => unreachable!(),
                     }
                 }
@@ -603,16 +670,11 @@ fn setup_slot_recording(
             let slot_callback = Arc::new({
                 let slots = Arc::clone(&slot_details);
                 move |bank: &Bank| {
-                    let mut details = if include_bank {
-                        bank_hash_details::SlotDetails::try_from(bank).unwrap()
-                    } else {
-                        bank_hash_details::SlotDetails {
-                            slot: bank.slot(),
-                            bank_hash: bank.hash().to_string(),
-                            ..Default::default()
-                        }
-                    };
-
+                    let mut details = bank_hash_details::SlotDetails::new_from_bank(
+                        bank,
+                        include_bank_hash_components,
+                    )
+                    .unwrap();
                     let mut slots = slots.lock().unwrap();
 
                     if let Some(recorded_slot) = slots.iter_mut().find(|f| f.slot == details.slot) {
@@ -683,8 +745,6 @@ fn record_transactions(
 ) {
     for tsm in recv {
         if let TransactionStatusMessage::Batch(batch) = tsm {
-            let slot = batch.bank.slot();
-
             assert_eq!(batch.transactions.len(), batch.commit_results.len());
 
             let transactions: Vec<_> = batch
@@ -704,20 +764,18 @@ fn record_transactions(
                     let instructions = message
                         .instructions()
                         .iter()
-                        .map(|ix| UiInstruction::parse(ix, &message.account_keys(), None))
+                        .map(|ix| parse_ui_instruction(ix, &message.account_keys(), None))
                         .collect();
 
                     let is_simple_vote_tx = tx.is_simple_vote_transaction();
-                    let execution_results = commit_result
-                        .ok()
-                        .map(|committed_tx| committed_tx.execution_details);
+                    let commit_details = commit_result.ok().map(|committed_tx| committed_tx.into());
 
                     TransactionDetails {
                         signature: tx.signature().to_string(),
                         accounts,
                         instructions,
                         is_simple_vote_tx,
-                        execution_results,
+                        commit_details,
                         index,
                     }
                 })
@@ -725,11 +783,11 @@ fn record_transactions(
 
             let mut slots = slots.lock().unwrap();
 
-            if let Some(recorded_slot) = slots.iter_mut().find(|f| f.slot == slot) {
+            if let Some(recorded_slot) = slots.iter_mut().find(|f| f.slot == batch.slot) {
                 recorded_slot.transactions.extend(transactions);
             } else {
                 slots.push(SlotDetails {
-                    slot,
+                    slot: batch.slot,
                     transactions,
                     ..Default::default()
                 });
@@ -742,10 +800,10 @@ fn record_transactions(
     }
 }
 
-#[cfg(not(target_env = "msvc"))]
+#[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
 use jemallocator::Jemalloc;
 
-#[cfg(not(target_env = "msvc"))]
+#[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
@@ -1083,29 +1141,6 @@ fn main() {
                         ),
                 )
                 .arg(
-                    Arg::with_name("partitioned_epoch_rewards_compare_calculation")
-                        .long("partitioned-epoch-rewards-compare-calculation")
-                        .takes_value(false)
-                        .help(
-                            "Do normal epoch rewards distribution, but also calculate rewards \
-                             using the partitioned rewards code path and compare the resulting \
-                             vote and stake accounts",
-                        )
-                        .hidden(hidden_unless_forced()),
-                )
-                .arg(
-                    Arg::with_name("partitioned_epoch_rewards_force_enable_single_slot")
-                        .long("partitioned-epoch-rewards-force-enable-single-slot")
-                        .takes_value(false)
-                        .help(
-                            "Force the partitioned rewards distribution, but distribute all \
-                             rewards in the first slot in the epoch. This should match consensus \
-                             with the normal rewards distribution.",
-                        )
-                        .conflicts_with("partitioned_epoch_rewards_compare_calculation")
-                        .hidden(hidden_unless_forced()),
-                )
-                .arg(
                     Arg::with_name("print_accounts_stats")
                         .long("print-accounts-stats")
                         .takes_value(false)
@@ -1158,6 +1193,30 @@ fn main() {
                             "geyser_plugin_config",
                         ])
                         .help("In addition to the bank hash, optionally include accounts and/or transactions details for the slot"),
+                )
+                .arg(
+                    Arg::with_name("abort_on_invalid_block")
+                        .long("abort-on-invalid-block")
+                        .takes_value(false)
+                        .help(
+                            "Exits with failed status early as soon as any bad block is detected",
+                        ),
+                )
+                .arg(
+                    Arg::with_name("no_block_cost_limits")
+                        .long("no-block-cost-limits")
+                        .takes_value(false)
+                        .help("Disable block cost limits effectively by setting them to the max"),
+                )
+                .arg(
+                    Arg::with_name("enable_hash_overrides")
+                        .long("enable-hash-overrides")
+                        .takes_value(false)
+                        .help(
+                            "Enable override of blockhashes and bank hashes from banking trace \
+                             event files to correctly verify blocks produced by \
+                             the simulate-block-production subcommand",
+                        ),
                 ),
         )
         .subcommand(
@@ -1394,10 +1453,54 @@ fn main() {
                         .conflicts_with("no_snapshot"),
                 )
                 .arg(
+                    Arg::with_name("snapshot_zstd_compression_level")
+                        .long("snapshot-zstd-compression-level")
+                        .default_value("0")
+                        .value_name("LEVEL")
+                        .takes_value(true)
+                        .help("The compression level to use when archiving with zstd")
+                        .long_help(
+                            "The compression level to use when archiving with zstd. \
+                             Higher compression levels generally produce higher \
+                             compression ratio at the expense of speed and memory. \
+                             See the zstd manpage for more information."
+                        ),
+                )
+                .arg(
                     Arg::with_name("enable_capitalization_change")
                         .long("enable-capitalization-change")
                         .takes_value(false)
                         .help("If snapshot creation should succeed with a capitalization delta."),
+                ),
+        )
+        .subcommand(
+            SubCommand::with_name("simulate-block-production")
+                .about("Simulate producing blocks with banking trace event files in the ledger")
+                .arg(&load_genesis_config_arg)
+                .args(&accounts_db_config_args)
+                .args(&snapshot_config_args)
+                .arg(
+                    Arg::with_name("block_production_method")
+                        .long("block-production-method")
+                        .value_name("METHOD")
+                        .takes_value(true)
+                        .possible_values(BlockProductionMethod::cli_names())
+                        .help(BlockProductionMethod::cli_message()),
+                )
+                .arg(
+                    Arg::with_name("first_simulated_slot")
+                        .long("first-simulated-slot")
+                        .value_name("SLOT")
+                        .validator(is_slot)
+                        .takes_value(true)
+                        .required(true)
+                        .help("Start simulation at the given slot")
+                )
+                .arg(
+                    Arg::with_name("no_block_cost_limits")
+                        .long("no-block-cost-limits")
+                        .takes_value(false)
+                        .help("Disable block cost limits effectively by setting them to the max"),
                 ),
         )
         .subcommand(
@@ -1674,6 +1777,12 @@ fn main() {
                     );
 
                     let mut process_options = parse_process_options(&ledger_path, arg_matches);
+                    if arg_matches.is_present("enable_hash_overrides") {
+                        let banking_trace_events = load_banking_trace_events_or_exit(&ledger_path);
+                        process_options.hash_overrides =
+                            Some(banking_trace_events.hash_overrides().clone());
+                    }
+
                     let (slot_callback, slot_recorder_config) = setup_slot_recording(arg_matches);
                     process_options.slot_callback = slot_callback;
                     let transaction_status_sender = slot_recorder_config
@@ -1810,11 +1919,11 @@ fn main() {
                     let is_minimized = arg_matches.is_present("minimized");
                     let output_directory = value_t!(arg_matches, "output_directory", PathBuf)
                         .unwrap_or_else(|_| {
-                            let snapshot_archive_path = value_t!(matches, "snapshots", String)
+                            let snapshot_archive_path = value_t!(arg_matches, "snapshots", String)
                                 .ok()
                                 .map(PathBuf::from);
                             let incremental_snapshot_archive_path =
-                                value_t!(matches, "incremental_snapshot_archive_path", String)
+                                value_t!(arg_matches, "incremental_snapshot_archive_path", String)
                                     .ok()
                                     .map(PathBuf::from);
                             match (
@@ -1879,9 +1988,18 @@ fn main() {
                     let snapshot_archive_format = {
                         let archive_format_str =
                             value_t_or_exit!(arg_matches, "snapshot_archive_format", String);
-                        ArchiveFormat::from_cli_arg(&archive_format_str).unwrap_or_else(|| {
-                            panic!("Archive format not recognized: {archive_format_str}")
-                        })
+                        let mut archive_format = ArchiveFormat::from_cli_arg(&archive_format_str)
+                            .unwrap_or_else(|| {
+                                panic!("Archive format not recognized: {archive_format_str}")
+                            });
+                        if let ArchiveFormat::TarZstd { config } = &mut archive_format {
+                            config.compression_level = value_t_or_exit!(
+                                arg_matches,
+                                "snapshot_zstd_compression_level",
+                                i32
+                            );
+                        }
+                        archive_format
                     };
 
                     let genesis_config = open_genesis_config_by(&ledger_path, arg_matches);
@@ -1987,7 +2105,7 @@ fn main() {
                         .accounts
                         .accounts_db
                         .verify_accounts_hash_in_bg
-                        .wait_for_complete();
+                        .join_background_thread();
 
                     let child_bank_required = rent_burn_percentage.is_ok()
                         || hashes_per_tick.is_some()
@@ -2016,6 +2134,36 @@ fn main() {
                                 _ => Some(value_t_or_exit!(arg_matches, "hashes_per_tick", u64)),
                             });
                         }
+
+                        for address in feature_gates_to_deactivate {
+                            let mut account =
+                                child_bank.get_account(&address).unwrap_or_else(|| {
+                                    eprintln!(
+                                        "Error: Feature-gate account does not exist, unable to \
+                                         deactivate it: {address}"
+                                    );
+                                    exit(1);
+                                });
+
+                            match feature::from_account(&account) {
+                                Some(feature) => {
+                                    if feature.activated_at.is_none() {
+                                        warn!("Feature gate is not yet activated: {address}");
+                                    } else {
+                                        child_bank.deactivate_feature(&address);
+                                    }
+                                }
+                                None => {
+                                    eprintln!("Error: Account is not a `Feature`: {address}");
+                                    exit(1);
+                                }
+                            }
+
+                            account.set_lamports(0);
+                            child_bank.store_account(&address, &account);
+                            debug!("Feature gate deactivated: {address}");
+                        }
+
                         bank = Arc::new(child_bank);
                     }
 
@@ -2028,7 +2176,10 @@ fn main() {
 
                     if remove_stake_accounts {
                         for (address, mut account) in bank
-                            .get_program_accounts(&stake::program::id(), &ScanConfig::new(false))
+                            .get_program_accounts(
+                                &stake::program::id(),
+                                &ScanConfig::new(ScanOrder::Sorted),
+                            )
                             .unwrap()
                             .into_iter()
                         {
@@ -2050,35 +2201,12 @@ fn main() {
                         debug!("Account removed: {address}");
                     }
 
-                    for address in feature_gates_to_deactivate {
-                        let mut account = bank.get_account(&address).unwrap_or_else(|| {
-                            eprintln!(
-                                "Error: Feature-gate account does not exist, unable to \
-                                     deactivate it: {address}"
-                            );
-                            exit(1);
-                        });
-
-                        match feature::from_account(&account) {
-                            Some(feature) => {
-                                if feature.activated_at.is_none() {
-                                    warn!("Feature gate is not yet activated: {address}");
-                                }
-                            }
-                            None => {
-                                eprintln!("Error: Account is not a `Feature`: {address}");
-                                exit(1);
-                            }
-                        }
-
-                        account.set_lamports(0);
-                        bank.store_account(&address, &account);
-                        debug!("Feature gate deactivated: {address}");
-                    }
-
                     if !vote_accounts_to_destake.is_empty() {
                         for (address, mut account) in bank
-                            .get_program_accounts(&stake::program::id(), &ScanConfig::new(false))
+                            .get_program_accounts(
+                                &stake::program::id(),
+                                &ScanConfig::new(ScanOrder::Sorted),
+                            )
                             .unwrap()
                             .into_iter()
                         {
@@ -2118,7 +2246,7 @@ fn main() {
                         for (address, mut account) in bank
                             .get_program_accounts(
                                 &solana_vote_program::id(),
-                                &ScanConfig::new(false),
+                                &ScanConfig::new(ScanOrder::Sorted),
                             )
                             .unwrap()
                             .into_iter()
@@ -2224,9 +2352,13 @@ fn main() {
                     };
 
                     let bank = if let Some(warp_slot) = warp_slot {
-                        // need to flush the write cache in order to use Storages to calculate
-                        // the accounts hash, and need to root `bank` before flushing the cache
-                        bank.rc.accounts.accounts_db.add_root(bank.slot());
+                        // Need to flush the write cache in order to use
+                        // Storages to calculate the accounts hash, and need to
+                        // root `bank` before flushing the cache. Use squash to
+                        // root all unrooted parents as well and avoid panicking
+                        // during snapshot creation if we try to add roots out
+                        // of order.
+                        bank.squash();
                         bank.force_flush_accounts_cache();
                         Arc::new(Bank::warp_from_parent(
                             bank.clone(),
@@ -2357,6 +2489,65 @@ fn main() {
                         exit_signal.store(true, Ordering::Relaxed);
                         system_monitor_service.join().unwrap();
                     }
+                }
+                ("simulate-block-production", Some(arg_matches)) => {
+                    let mut process_options = parse_process_options(&ledger_path, arg_matches);
+
+                    let banking_trace_events = load_banking_trace_events_or_exit(&ledger_path);
+                    process_options.hash_overrides =
+                        Some(banking_trace_events.hash_overrides().clone());
+
+                    let slot = value_t!(arg_matches, "first_simulated_slot", Slot).unwrap();
+                    let simulator = BankingSimulator::new(banking_trace_events, slot);
+                    let Some(parent_slot) = simulator.parent_slot() else {
+                        eprintln!(
+                            "Couldn't determine parent_slot of first_simulated_slot: {slot} \
+                             due to missing banking_trace_event data."
+                        );
+                        exit(1);
+                    };
+                    process_options.halt_at_slot = Some(parent_slot);
+
+                    let blockstore = Arc::new(open_blockstore(
+                        &ledger_path,
+                        arg_matches,
+                        AccessType::Primary, // needed for purging already existing simulated block shreds...
+                    ));
+                    let genesis_config = open_genesis_config_by(&ledger_path, arg_matches);
+                    let LoadAndProcessLedgerOutput { bank_forks, .. } =
+                        load_and_process_ledger_or_exit(
+                            arg_matches,
+                            &genesis_config,
+                            blockstore.clone(),
+                            process_options,
+                            None, // transaction status sender
+                        );
+
+                    let block_production_method = value_t!(
+                        arg_matches,
+                        "block_production_method",
+                        BlockProductionMethod
+                    )
+                    .unwrap_or_default();
+                    let transaction_struct =
+                        value_t!(arg_matches, "transaction_struct", TransactionStructure)
+                            .unwrap_or_default();
+
+                    info!("Using: block-production-method: {block_production_method} transaction-structure: {transaction_struct}");
+
+                    match simulator.start(
+                        genesis_config,
+                        bank_forks,
+                        blockstore,
+                        block_production_method,
+                        transaction_struct,
+                    ) {
+                        Ok(()) => println!("Ok"),
+                        Err(error) => {
+                            eprintln!("{error:?}");
+                            exit(1);
+                        }
+                    };
                 }
                 ("accounts", Some(arg_matches)) => {
                     let process_options = parse_process_options(&ledger_path, arg_matches);
@@ -2570,7 +2761,6 @@ fn main() {
                             new_credits_observed: Option<u64>,
                             skipped_reasons: String,
                         }
-                        use solana_stake_program::points::InflationPointCalculationEvent;
                         let stake_calculation_details: DashMap<Pubkey, CalculationDetail> =
                             DashMap::new();
                         let last_point_value = Arc::new(RwLock::new(None));

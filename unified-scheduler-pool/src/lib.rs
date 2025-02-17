@@ -1,27 +1,34 @@
 //! Transaction scheduling code.
 //!
-//! This crate implements 3 solana-runtime traits (`InstalledScheduler`, `UninstalledScheduler` and
-//! `InstalledSchedulerPool`) to provide a concrete transaction scheduling implementation
+//! This crate implements 3 solana-runtime traits [`InstalledScheduler`], [`UninstalledScheduler`]
+//! and [`InstalledSchedulerPool`] to provide a concrete transaction scheduling implementation
 //! (including executing txes and committing tx results).
 //!
-//! At the highest level, this crate takes `SanitizedTransaction`s via its `schedule_execution()`
-//! and commits any side-effects (i.e. on-chain state changes) into the associated `Bank` via
-//! `solana-ledger`'s helper function called `execute_batch()`.
+//! At the highest level, this crate takes [`SanitizedTransaction`]s via its
+//! [`InstalledScheduler::schedule_execution`] and commits any side-effects (i.e. on-chain state
+//! changes) into the associated [`Bank`](solana_runtime::bank::Bank) via `solana-ledger`'s helper
+//! function called [`execute_batch`].
+//!
+//! Refer to [`PooledScheduler`] doc comment for general overview of scheduler state transitions
+//! regarding to pooling and the actual use.
 
 #[cfg(feature = "dev-context-only-utils")]
 use qualifier_attr::qualifiers;
 use {
+    agave_banking_stage_ingress_types::{BankingPacketBatch, BankingPacketReceiver},
     assert_matches::assert_matches,
     crossbeam_channel::{self, never, select_biased, Receiver, RecvError, SendError, Sender},
     dashmap::DashMap,
-    derivative::Derivative,
+    derive_where::derive_where,
+    dyn_clone::{clone_trait_object, DynClone},
     log::*,
     scopeguard::defer,
     solana_ledger::blockstore_processor::{
         execute_batch, TransactionBatchWithIndexes, TransactionStatusSender,
     },
+    solana_poh::poh_recorder::{RecordTransactionsSummary, TransactionRecorder},
+    solana_pubkey::Pubkey,
     solana_runtime::{
-        bank::Bank,
         installed_scheduler_pool::{
             initialized_result_with_timings, InstalledScheduler, InstalledSchedulerBox,
             InstalledSchedulerPool, InstalledSchedulerPoolArc, ResultWithTimings, ScheduleResult,
@@ -31,23 +38,27 @@ use {
         prioritization_fee_cache::PrioritizationFeeCache,
         vote_sender_types::ReplayVoteSender,
     },
-    solana_sdk::{
-        pubkey::Pubkey,
-        transaction::{Result, SanitizedTransaction, TransactionError},
-    },
+    solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
     solana_timings::ExecuteTimings,
-    solana_unified_scheduler_logic::{SchedulingStateMachine, Task, UsageQueue},
+    solana_transaction::sanitized::SanitizedTransaction,
+    solana_transaction_error::{TransactionError, TransactionResult as Result},
+    solana_unified_scheduler_logic::{
+        SchedulingMode::{self, BlockProduction, BlockVerification},
+        SchedulingStateMachine, Task, UsageQueue,
+    },
+    static_assertions::const_assert_eq,
     std::{
         fmt::Debug,
         marker::PhantomData,
         mem,
         sync::{
-            atomic::{AtomicU64, Ordering::Relaxed},
+            atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed},
             Arc, Mutex, OnceLock, Weak,
         },
         thread::{self, sleep, JoinHandle},
         time::{Duration, Instant},
     },
+    trait_set::trait_set,
     vec_extract_if_polyfill::MakeExtractIf,
 };
 
@@ -68,16 +79,28 @@ enum CheckPoint {
 
 type AtomicSchedulerId = AtomicU64;
 
-// SchedulerPool must be accessed as a dyn trait from solana-runtime, because SchedulerPool
-// contains some internal fields, whose types aren't available in solana-runtime (currently
-// TransactionStatusSender; also, PohRecorder in the future)...
+/// A pool of idling schedulers (usually [`PooledScheduler`]), ready to be taken by bank.
+///
+/// Also, the pool runs a _cleaner_ thread named as `solScCleaner`. its jobs include:
+///
+/// - Shrink of pool if there are too many idle schedulers.
+/// - Invocation of timeouts registered by [`InstalledSchedulerPool::register_timeout_listener`].
+/// - The actual destruction of any retired schedulers including thread termination and the heavy
+///   `UsageQueueLoader` drop.
+///
+/// `SchedulerPool` (and [`PooledScheduler`] in this regard) must be accessed as a dyn trait from
+/// `solana-runtime`, because it contains some internal fields, whose types aren't available in
+/// `solana-runtime` ( [`TransactionStatusSender`] and [`TransactionRecorder`]). Refer to the doc
+/// comment with a diagram at [`solana_runtime::installed_scheduler_pool::InstalledScheduler`] for
+/// explanation of this rather complex dyn trait/type hierarchy.
 #[derive(Debug)]
 pub struct SchedulerPool<S: SpawnableScheduler<TH>, TH: TaskHandler> {
     scheduler_inners: Mutex<Vec<(S::Inner, Instant)>>,
     trashed_scheduler_inners: Mutex<Vec<S::Inner>>,
     timeout_listeners: Mutex<Vec<(TimeoutListener, Instant)>>,
     handler_count: usize,
-    handler_context: HandlerContext,
+    common_handler_context: CommonHandlerContext,
+    banking_stage_handler_context: Mutex<Option<BankingStageHandlerContext>>,
     // weak_self could be elided by changing InstalledScheduler::take_scheduler()'s receiver to
     // Arc<Self> from &Self, because SchedulerPool is used as in the form of Arc<SchedulerPool>
     // almost always. But, this would cause wasted and noisy Arc::clone()'s at every call sites.
@@ -94,12 +117,105 @@ pub struct SchedulerPool<S: SpawnableScheduler<TH>, TH: TaskHandler> {
     _phantom: PhantomData<TH>,
 }
 
-#[derive(Debug)]
+#[derive(derive_more::Debug, Clone)]
 pub struct HandlerContext {
     log_messages_bytes_limit: Option<usize>,
     transaction_status_sender: Option<TransactionStatusSender>,
     replay_vote_sender: Option<ReplayVoteSender>,
     prioritization_fee_cache: Arc<PrioritizationFeeCache>,
+    banking_packet_receiver: BankingPacketReceiver,
+    #[debug("{banking_packet_handler:p}")]
+    banking_packet_handler: Box<dyn BankingPacketHandler>,
+    banking_stage_helper: Option<Arc<BankingStageHelper>>,
+    transaction_recorder: Option<TransactionRecorder>,
+}
+
+#[derive(Debug, Clone)]
+struct CommonHandlerContext {
+    log_messages_bytes_limit: Option<usize>,
+    transaction_status_sender: Option<TransactionStatusSender>,
+    replay_vote_sender: Option<ReplayVoteSender>,
+    prioritization_fee_cache: Arc<PrioritizationFeeCache>,
+}
+
+impl CommonHandlerContext {
+    fn into_handler_context(
+        self,
+        banking_packet_receiver: BankingPacketReceiver,
+        banking_packet_handler: Box<dyn BankingPacketHandler>,
+        banking_stage_helper: Option<Arc<BankingStageHelper>>,
+        transaction_recorder: Option<TransactionRecorder>,
+    ) -> HandlerContext {
+        let Self {
+            log_messages_bytes_limit,
+            transaction_status_sender,
+            replay_vote_sender,
+            prioritization_fee_cache,
+        } = self;
+
+        HandlerContext {
+            log_messages_bytes_limit,
+            transaction_status_sender,
+            replay_vote_sender,
+            prioritization_fee_cache,
+            banking_packet_receiver,
+            banking_packet_handler,
+            banking_stage_helper,
+            transaction_recorder,
+        }
+    }
+}
+
+#[derive(derive_more::Debug)]
+struct BankingStageHandlerContext {
+    banking_packet_receiver: BankingPacketReceiver,
+    #[debug("{banking_packet_handler:p}")]
+    banking_packet_handler: Box<dyn BankingPacketHandler>,
+    transaction_recorder: TransactionRecorder,
+}
+
+trait_set! {
+    pub trait BankingPacketHandler =
+        DynClone + FnMut(&BankingStageHelper, BankingPacketBatch) + Send + 'static;
+}
+// Make this `Clone`-able so that it can easily propagated to all the handler threads.
+clone_trait_object!(BankingPacketHandler);
+
+#[derive(Debug)]
+pub struct BankingStageHelper {
+    usage_queue_loader: UsageQueueLoader,
+    next_task_id: AtomicUsize,
+    new_task_sender: Sender<NewTaskPayload>,
+}
+
+impl BankingStageHelper {
+    fn new(new_task_sender: Sender<NewTaskPayload>) -> Self {
+        Self {
+            usage_queue_loader: UsageQueueLoader::default(),
+            next_task_id: AtomicUsize::default(),
+            new_task_sender,
+        }
+    }
+
+    pub fn generate_task_ids(&self, count: usize) -> usize {
+        self.next_task_id.fetch_add(count, Relaxed)
+    }
+
+    pub fn create_new_task(
+        &self,
+        transaction: RuntimeTransaction<SanitizedTransaction>,
+        index: usize,
+    ) -> Task {
+        SchedulingStateMachine::create_task(transaction, index, &mut |pubkey| {
+            self.usage_queue_loader.load(pubkey)
+        })
+    }
+
+    pub fn send_new_task(&self, task: Task) {
+        self.new_task_sender
+            .send(NewTaskPayload::Payload(task))
+            .unwrap();
+    }
 }
 
 pub type DefaultSchedulerPool =
@@ -171,12 +287,13 @@ where
             trashed_scheduler_inners: Mutex::default(),
             timeout_listeners: Mutex::default(),
             handler_count,
-            handler_context: HandlerContext {
+            common_handler_context: CommonHandlerContext {
                 log_messages_bytes_limit,
                 transaction_status_sender,
                 replay_vote_sender,
                 prioritization_fee_cache,
             },
+            banking_stage_handler_context: Mutex::default(),
             weak_self: weak_self.clone(),
             next_scheduler_id: AtomicSchedulerId::default(),
             max_usage_queue_count,
@@ -249,6 +366,9 @@ where
                     drop(timeout_listeners);
 
                     let count = expired_listeners.len();
+                    // Now triggers all expired listeners. Usually, triggering timeouts does
+                    // nothing because the callbacks will be no-op if already successfully
+                    // `wait_for_termination()`-ed.
                     for (timeout_listener, _registered_at) in expired_listeners {
                         timeout_listener.trigger(scheduler_pool.clone());
                     }
@@ -307,7 +427,10 @@ where
 
     // This fn needs to return immediately due to being part of the blocking
     // `::wait_for_termination()` call.
-    fn return_scheduler(&self, scheduler: S::Inner, should_trash: bool) {
+    fn return_scheduler(&self, scheduler: S::Inner) {
+        // Refer to the comment in is_aborted() as to the exact definition of the concept of
+        // _trashed_ and the interaction among different parts of unified scheduler.
+        let should_trash = scheduler.is_trashed();
         if should_trash {
             // Delay drop()-ing this trashed returned scheduler inner by stashing it in
             // self.trashed_scheduler_inners, which is periodically drained by the `solScCleaner`
@@ -350,6 +473,59 @@ where
     #[cfg(feature = "dev-context-only-utils")]
     pub fn pooled_scheduler_count(&self) -> usize {
         self.scheduler_inners.lock().expect("not poisoned").len()
+    }
+
+    pub fn register_banking_stage(
+        &self,
+        banking_packet_receiver: BankingPacketReceiver,
+        banking_packet_handler: Box<dyn BankingPacketHandler>,
+        transaction_recorder: TransactionRecorder,
+    ) {
+        *self.banking_stage_handler_context.lock().unwrap() = Some(BankingStageHandlerContext {
+            banking_packet_receiver,
+            banking_packet_handler,
+            transaction_recorder,
+        });
+    }
+
+    fn create_handler_context(
+        &self,
+        mode: SchedulingMode,
+        new_task_sender: &Sender<NewTaskPayload>,
+    ) -> HandlerContext {
+        let (
+            banking_packet_receiver,
+            banking_packet_handler,
+            banking_stage_helper,
+            transaction_recorder,
+        ): (
+            _,
+            Box<dyn BankingPacketHandler>, /* to aid type inference */
+            _,
+            _,
+        ) = match mode {
+            BlockVerification => {
+                // Return various type-specific no-op values.
+                (never(), Box::new(|_, _| {}), None, None)
+            }
+            BlockProduction => {
+                let handler_context = self.banking_stage_handler_context.lock().unwrap();
+                let handler_context = handler_context.as_ref().unwrap();
+
+                (
+                    handler_context.banking_packet_receiver.clone(),
+                    handler_context.banking_packet_handler.clone(),
+                    Some(Arc::new(BankingStageHelper::new(new_task_sender.clone()))),
+                    Some(handler_context.transaction_recorder.clone()),
+                )
+            }
+        };
+        self.common_handler_context.clone().into_handler_context(
+            banking_packet_receiver,
+            banking_packet_handler,
+            banking_stage_helper,
+            transaction_recorder,
+        )
     }
 
     pub fn default_handler_count() -> usize {
@@ -409,9 +585,8 @@ pub trait TaskHandler: Send + Sync + Debug + Sized + 'static {
     fn handle(
         result: &mut Result<()>,
         timings: &mut ExecuteTimings,
-        bank: &Arc<Bank>,
-        transaction: &SanitizedTransaction,
-        index: usize,
+        scheduling_context: &SchedulingContext,
+        task: &Task,
         handler_context: &HandlerContext,
     );
 }
@@ -423,17 +598,58 @@ impl TaskHandler for DefaultTaskHandler {
     fn handle(
         result: &mut Result<()>,
         timings: &mut ExecuteTimings,
-        bank: &Arc<Bank>,
-        transaction: &SanitizedTransaction,
-        index: usize,
+        scheduling_context: &SchedulingContext,
+        task: &Task,
         handler_context: &HandlerContext,
     ) {
         // scheduler must properly prevent conflicting tx executions. thus, task handler isn't
         // responsible for locking.
+        let bank = scheduling_context.bank();
+        let transaction = task.transaction();
+        let index = task.task_index();
+
         let batch = bank.prepare_unlocked_batch_from_single_tx(transaction);
+        let transaction_indexes = match scheduling_context.mode() {
+            BlockVerification => vec![index],
+            BlockProduction => {
+                // Create a placeholder vec, which will be populated later if
+                // transaction_status_sender is Some(_).
+                // transaction_status_sender is usually None for staked nodes because it's only
+                // used for RPC-related additional data recording. However, a staked node could
+                // also be running with rpc functionalities during development. So, we need to
+                // correctly support the use case for produced blocks as well, like verified blocks
+                // via the replaying stage.
+                // Refer `record_token_balances` in `execute_batch()` as this treatment is mirrored
+                // from it.
+                vec![]
+            }
+        };
         let batch_with_indexes = TransactionBatchWithIndexes {
             batch,
-            transaction_indexes: vec![index],
+            transaction_indexes,
+        };
+
+        let pre_commit_callback = match scheduling_context.mode() {
+            BlockVerification => None,
+            BlockProduction => Some(|processing_result: &'_ Result<_>| {
+                if let Err(error) = processing_result {
+                    Err(error.clone())?;
+                };
+
+                let RecordTransactionsSummary {
+                    result,
+                    starting_transaction_index,
+                    ..
+                } = handler_context
+                    .transaction_recorder
+                    .as_ref()
+                    .unwrap()
+                    .record_transactions(bank.slot(), vec![transaction.to_versioned_transaction()]);
+                match result {
+                    Ok(()) => Ok(starting_transaction_index),
+                    Err(_) => Err(TransactionError::CommitCancelled),
+                }
+            }),
         };
 
         *result = execute_batch(
@@ -444,6 +660,7 @@ impl TaskHandler for DefaultTaskHandler {
             timings,
             handler_context.log_messages_bytes_limit,
             &handler_context.prioritization_fee_cache,
+            pre_commit_callback,
         );
         sleepless_testing::at(CheckPoint::TaskHandled(index));
     }
@@ -475,7 +692,8 @@ enum SubchanneledPayload<P1, P2> {
     CloseSubchannel,
 }
 
-type NewTaskPayload = SubchanneledPayload<Task, (SchedulingContext, ResultWithTimings)>;
+type NewTaskPayload = SubchanneledPayload<Task, Box<(SchedulingContext, ResultWithTimings)>>;
+const_assert_eq!(mem::size_of::<NewTaskPayload>(), 16);
 
 // A tiny generic message type to synchronize multiple threads everytime some contextual data needs
 // to be switched (ie. SchedulingContext), just using a single communication channel.
@@ -547,7 +765,7 @@ mod chained_channel {
 
         pub(super) fn send_chained_channel(
             &mut self,
-            context: C,
+            context: &C,
             count: usize,
         ) -> std::result::Result<(), SendError<ChainedChannel<P, C>>> {
             let (chained_sender, chained_receiver) = crossbeam_channel::unbounded();
@@ -567,8 +785,7 @@ mod chained_channel {
 
     // P doesn't need to be `: Clone`, yet rustc derive can't handle it.
     // see https://github.com/rust-lang/rust/issues/26925
-    #[derive(Derivative)]
-    #[derivative(Clone(bound = "C: Clone"))]
+    #[derive_where(Clone)]
     pub(super) struct ChainedChannelReceiver<P, C: Clone> {
         receiver: Receiver<ChainedChannel<P, C>>,
         aux_receiver: Receiver<P>,
@@ -631,10 +848,10 @@ mod chained_channel {
 
 /// The primary owner of all [`UsageQueue`]s used for particular [`PooledScheduler`].
 ///
-/// Currently, the simplest implementation. This grows memory usage in unbounded way. Cleaning will
-/// be added later. This struct is here to be put outside `solana-unified-scheduler-logic` for the
-/// crate's original intent (separation of logics from this crate). Some practical and mundane
-/// pruning will be implemented in this type.
+/// Currently, the simplest implementation. This grows memory usage in unbounded way. Overgrown
+/// instance destruction is managed via `solScCleaner`. This struct is here to be put outside
+/// `solana-unified-scheduler-logic` for the crate's original intent (separation of concerns from
+/// the pure-logic-only crate). Some practical and mundane pruning will be implemented in this type.
 #[derive(Default, Debug)]
 pub struct UsageQueueLoader {
     usage_queues: DashMap<Pubkey, UsageQueue>,
@@ -658,6 +875,73 @@ fn disconnected<T>() -> Receiver<T> {
     crossbeam_channel::unbounded().1
 }
 
+#[cfg_attr(doc, aquamarine::aquamarine)]
+/// The concrete scheduler instance along with 1 scheduler and N handler threads.
+///
+/// This implements the dyn-compatible [`InstalledScheduler`] trait to be interacted by
+/// solana-runtime code as `Box<dyn _>`.  This also implements the [`SpawnableScheduler`] subtrait
+/// to be spawned and pooled by [`SchedulerPool`].  When a scheduler is said to be _taken_ from a
+/// pool, the Rust's ownership is literally moved from the pool's vec to the particular
+/// [`BankWithScheduler`](solana_runtime::installed_scheduler_pool::BankWithScheduler) for
+/// type-level protection against double-use by different banks. As soon as the bank is
+/// [`is_complete()`](`solana_runtime::bank::Bank::is_complete`) (i.e. ready for freezing), the
+/// associated scheduler is immediately _returned_ to the pool via
+/// [`InstalledScheduler::wait_for_termination`], to be taken by other banks quickly (usually,
+/// child bank).
+///
+/// Pooling is implemented to avoid repeated thread creation/destruction. Further more, each
+/// scheduler should manage its own set of threads, to be independent from other scheduler's
+/// threads for concurrent and efficient processing of banks of different forks.
+///
+/// It's intentionally designed for a start and end of scheduler use by banks not to incur any
+/// heavy system resource manipulation to reduce the latency of this per-block bookkeeping as much
+/// as possible.
+///
+/// To complement the above most common situation, there's various erroneous conditions: timeouts
+/// and abortions.
+///
+/// Timeouts are for rare conditions where there are abandoned-yet-unpruned banks in the
+/// [`BankForks`](solana_runtime::bank_forks::BankForks) under forky (unsteady rooting) cluster
+/// conditions. The pool's background cleaner thread (`solScCleaner`) triggers the timeout-based
+/// out-of-pool (i.e. _taken_) scheduler reclaimation with prior coordination of
+/// [`BankForks::insert()`](solana_runtime::bank_forks::BankForks::insert) via
+/// [`InstalledSchedulerPool::register_timeout_listener`].
+///
+/// Abortions are for another rate conditions where there's a fatal processing error, marking the
+/// given block as dead. In this case, all threads are terminated abruptly as much as possible to
+/// avoid any further system resource consumption on this possibly malice block. This error
+/// condition can implicitly be signalled to the replay stage on further transaction scheduling or
+/// can explicitly be done so on the eventual `wait_for_termination()` by drops or timeouts.
+///
+/// Lastly, scheduler can finally be _retired_ to be ready for thread termination due to various
+/// reasons like [`UsageQueueLoader`] being overgrown or many idling schedulers in the pool, in
+/// addition to the obvious reason of aborted scheduler.
+///
+/// ### Life cycle and ownership movement across crates of a particular scheduler
+///
+/// ```mermaid
+/// stateDiagram-v2
+///     [*] --> Active: Spawned (New bank by solReplayStage)
+///     state solana-runtime {
+///         state if_usable <<choice>>
+///         Active --> if_usable: Returned (Bank-freezing by solReplayStage)
+///         Active --> if_usable: Dropped (BankForks-pruning by solReplayStage)
+///         Aborted --> if_usable: Dropped (BankForks-pruning by solReplayStage)
+///         if_usable --> Pooled: IF !overgrown && !aborted
+///         Active --> Aborted: Errored on TX execution
+///         Aborted --> Stale: !Droppped after TIMEOUT_DURATION since taken
+///         Active --> Stale: No new TX after TIMEOUT_DURATION since taken
+///         Stale --> if_usable: Returned (Timeout-triggered by solScCleaner)
+///         Pooled --> Active: Taken (New bank by solReplayStage)
+///     }
+///     state solana-unified-scheduler-pool {
+///         Pooled --> Idle: !Taken after POOLING_DURATION
+///         if_usable --> Trashed: IF overgrown || aborted
+///         Idle --> Retired
+///         Trashed --> Retired
+///     }
+///     Retired --> [*]: Terminated (by solScCleaner)
+/// ```
 #[derive(Debug)]
 pub struct PooledScheduler<TH: TaskHandler> {
     inner: PooledSchedulerInner<Self, TH>,
@@ -710,14 +994,6 @@ where
     S: SpawnableScheduler<TH>,
     TH: TaskHandler,
 {
-    fn id(&self) -> SchedulerId {
-        self.thread_manager.scheduler_id
-    }
-
-    fn is_trashed(&self) -> bool {
-        self.is_aborted() || self.is_overgrown()
-    }
-
     fn is_aborted(&self) -> bool {
         // Schedulers can be regarded as being _trashed_ (thereby will be cleaned up later), if
         // threads are joined. Remember that unified scheduler _doesn't normally join threads_ even
@@ -730,11 +1006,12 @@ where
         // Note that this detection is done internally every time scheduler operations are run
         // (send_task() and end_session(); or schedule_execution() and wait_for_termination() in
         // terms of InstalledScheduler). So, it's ensured that the detection is done at least once
-        // for any scheudler which is taken out of the pool.
+        // for any scheduler which is taken out of the pool.
         //
         // Thus, any transaction errors are always handled without loss of information and
         // the aborted scheduler itself will always be handled as _trashed_ before returning the
-        // scheduler to the pool, considering is_trashed() is checked immediately before that.
+        // scheduler to the pool, considering is_aborted() is checked via is_trashed() immediately
+        // before that.
         self.thread_manager.are_threads_joined()
     }
 
@@ -768,7 +1045,6 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
     fn new(pool: Arc<SchedulerPool<S, TH>>) -> Self {
         let (new_task_sender, new_task_receiver) = crossbeam_channel::unbounded();
         let (session_result_sender, session_result_receiver) = crossbeam_channel::unbounded();
-        let handler_count = pool.handler_count;
 
         Self {
             scheduler_id: pool.new_scheduler_id(),
@@ -779,12 +1055,12 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
             session_result_receiver,
             session_result_with_timings: None,
             scheduler_thread: None,
-            handler_threads: Vec::with_capacity(handler_count),
+            handler_threads: vec![],
         }
     }
 
     fn execute_task_with_handler(
-        bank: &Arc<Bank>,
+        scheduling_context: &SchedulingContext,
         executed_task: &mut Box<ExecutedTask>,
         handler_context: &HandlerContext,
     ) {
@@ -792,9 +1068,8 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
         TH::handle(
             &mut executed_task.result_with_timings.0,
             &mut executed_task.result_with_timings.1,
-            bank,
-            executed_task.task.transaction(),
-            executed_task.task.task_index(),
+            scheduling_context,
+            &executed_task.task,
             handler_context,
         );
     }
@@ -838,6 +1113,7 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
         &mut self,
         context: SchedulingContext,
         mut result_with_timings: ResultWithTimings,
+        handler_context: HandlerContext,
     ) {
         // Firstly, setup bi-directional messaging between the scheduler and handlers to pass
         // around tasks, by creating 2 channels (one for to-be-handled tasks from the scheduler to
@@ -1030,7 +1306,7 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                             recv(finished_blocked_task_receiver) -> executed_task => {
                                 let Some(executed_task) = Self::accumulate_result_with_timings(
                                     &mut result_with_timings,
-                                    executed_task.expect("alive handler")
+                                    executed_task.expect("alive handler"),
                                 ) else {
                                     break 'nonaborted_main_loop;
                                 };
@@ -1070,7 +1346,7 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                             recv(finished_idle_task_receiver) -> executed_task => {
                                 let Some(executed_task) = Self::accumulate_result_with_timings(
                                     &mut result_with_timings,
-                                    executed_task.expect("alive handler")
+                                    executed_task.expect("alive handler"),
                                 ) else {
                                     break 'nonaborted_main_loop;
                                 };
@@ -1090,27 +1366,28 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                     state_machine.reinitialize();
                     session_ending = false;
 
-                    // Prepare for the new session.
-                    match new_task_receiver.recv() {
-                        Ok(NewTaskPayload::OpenSubchannel((
-                            new_context,
-                            new_result_with_timings,
-                        ))) => {
-                            // We just received subsequent (= not initial) session and about to
-                            // enter into the preceding `while(!is_finished) {...}` loop again.
-                            // Before that, propagate new SchedulingContext to handler threads
-                            runnable_task_sender
-                                .send_chained_channel(new_context, handler_count)
-                                .unwrap();
-                            result_with_timings = new_result_with_timings;
+                    {
+                        // Prepare for the new session.
+                        match new_task_receiver.recv() {
+                            Ok(NewTaskPayload::OpenSubchannel(context_and_result_with_timings)) => {
+                                let (new_context, new_result_with_timings) =
+                                    *context_and_result_with_timings;
+                                // We just received subsequent (= not initial) session and about to
+                                // enter into the preceding `while(!is_finished) {...}` loop again.
+                                // Before that, propagate new SchedulingContext to handler threads
+                                runnable_task_sender
+                                    .send_chained_channel(&new_context, handler_count)
+                                    .unwrap();
+                                result_with_timings = new_result_with_timings;
+                            }
+                            Err(_) => {
+                                // This unusual condition must be triggered by ThreadManager::drop().
+                                // Initialize result_with_timings with a harmless value...
+                                result_with_timings = initialized_result_with_timings();
+                                break 'nonaborted_main_loop;
+                            }
+                            Ok(_) => unreachable!(),
                         }
-                        Err(_) => {
-                            // This unusual condition must be triggered by ThreadManager::drop().
-                            // Initialize result_with_timings with a harmless value...
-                            result_with_timings = initialized_result_with_timings();
-                            break 'nonaborted_main_loop;
-                        }
-                        Ok(_) => unreachable!(),
                     }
                 }
 
@@ -1138,7 +1415,7 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
         };
 
         let handler_main_loop = || {
-            let pool = self.pool.clone();
+            let mut handler_context = handler_context.clone();
             let mut runnable_task_receiver = runnable_task_receiver.clone();
             let finished_blocked_task_sender = finished_blocked_task_sender.clone();
             let finished_idle_task_sender = finished_idle_task_sender.clone();
@@ -1151,53 +1428,68 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
             // 2. Subsequent contexts are propagated explicitly inside `.after_select()` as part of
             //    `select_biased!`, which are sent from `.send_chained_channel()` in the scheduler
             //    thread for all-but-initial sessions.
-            move || loop {
-                let (task, sender) = select_biased! {
-                    recv(runnable_task_receiver.for_select()) -> message => {
-                        let Ok(message) = message else {
-                            break;
-                        };
-                        if let Some(task) = runnable_task_receiver.after_select(message) {
-                            (task, &finished_blocked_task_sender)
-                        } else {
+            move || {
+                loop {
+                    let (task, sender) = select_biased! {
+                        recv(runnable_task_receiver.for_select()) -> message => {
+                            let Ok(message) = message else {
+                                break;
+                            };
+                            if let Some(task) = runnable_task_receiver.after_select(message) {
+                                (task, &finished_blocked_task_sender)
+                            } else {
+                                continue;
+                            }
+                        },
+                        recv(runnable_task_receiver.aux_for_select()) -> task => {
+                            if let Ok(task) = task {
+                                (task, &finished_idle_task_sender)
+                            } else {
+                                runnable_task_receiver.never_receive_from_aux();
+                                continue;
+                            }
+                        },
+                        recv(handler_context.banking_packet_receiver) -> banking_packet => {
+                            // See solana_core::banking_stage::unified_scheduler module doc as to
+                            // justification of this additional work in the handler thread.
+                            let Ok(banking_packet) = banking_packet else {
+                                info!("disconnected banking_packet_receiver");
+                                break;
+                            };
+                            (handler_context.banking_packet_handler)(
+                                handler_context.banking_stage_helper.as_ref().unwrap(),
+                                banking_packet
+                            );
                             continue;
+                        },
+                    };
+                    defer! {
+                        if !thread::panicking() {
+                            return;
                         }
-                    },
-                    recv(runnable_task_receiver.aux_for_select()) -> task => {
-                        if let Ok(task) = task {
-                            (task, &finished_idle_task_sender)
-                        } else {
-                            runnable_task_receiver.never_receive_from_aux();
-                            continue;
-                        }
-                    },
-                };
-                defer! {
-                    if !thread::panicking() {
-                        return;
-                    }
 
-                    // The scheduler thread can't detect panics in handler threads with
-                    // disconnected channel errors, unless all of them has died. So, send an
-                    // explicit Err promptly.
-                    let current_thread = thread::current();
-                    error!("handler thread is panicking: {:?}", current_thread);
-                    if sender.send(Err(HandlerPanicked)).is_ok() {
-                        info!("notified a panic from {:?}", current_thread);
-                    } else {
-                        // It seems that the scheduler thread has been aborted already...
-                        warn!("failed to notify a panic from {:?}", current_thread);
+                        // The scheduler thread can't detect panics in handler threads with
+                        // disconnected channel errors, unless all of them has died. So, send an
+                        // explicit Err promptly.
+                        let current_thread = thread::current();
+                        error!("handler thread is panicking: {:?}", current_thread);
+                        if sender.send(Err(HandlerPanicked)).is_ok() {
+                            info!("notified a panic from {:?}", current_thread);
+                        } else {
+                            // It seems that the scheduler thread has been aborted already...
+                            warn!("failed to notify a panic from {:?}", current_thread);
+                        }
                     }
-                }
-                let mut task = ExecutedTask::new_boxed(task);
-                Self::execute_task_with_handler(
-                    runnable_task_receiver.context().bank(),
-                    &mut task,
-                    &pool.handler_context,
-                );
-                if sender.send(Ok(task)).is_err() {
-                    warn!("handler_thread: scheduler thread aborted...");
-                    break;
+                    let mut task = ExecutedTask::new_boxed(task);
+                    Self::execute_task_with_handler(
+                        runnable_task_receiver.context(),
+                        &mut task,
+                        &handler_context,
+                    );
+                    if sender.send(Ok(task)).is_err() {
+                        warn!("handler_thread: scheduler thread aborted...");
+                        break;
+                    }
                 }
             }
         };
@@ -1332,16 +1624,21 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
         assert!(!self.are_threads_joined());
         assert_matches!(self.session_result_with_timings, None);
         self.new_task_sender
-            .send(NewTaskPayload::OpenSubchannel((
+            .send(NewTaskPayload::OpenSubchannel(Box::new((
                 context,
                 result_with_timings,
-            )))
+            ))))
             .expect("no new session after aborted");
     }
 }
 
+pub trait SchedulerInner {
+    fn id(&self) -> SchedulerId;
+    fn is_trashed(&self) -> bool;
+}
+
 pub trait SpawnableScheduler<TH: TaskHandler>: InstalledScheduler {
-    type Inner: Debug + Send + Sync;
+    type Inner: SchedulerInner + Debug + Send + Sync;
 
     fn into_inner(self) -> (ResultWithTimings, Self::Inner);
 
@@ -1389,12 +1686,14 @@ impl<TH: TaskHandler> SpawnableScheduler<TH> for PooledScheduler<TH> {
         result_with_timings: ResultWithTimings,
     ) -> Self {
         let mut inner = Self::Inner {
-            thread_manager: ThreadManager::new(pool),
+            thread_manager: ThreadManager::new(pool.clone()),
             usage_queue_loader: UsageQueueLoader::default(),
         };
-        inner
-            .thread_manager
-            .start_threads(context.clone(), result_with_timings);
+        inner.thread_manager.start_threads(
+            context.clone(),
+            result_with_timings,
+            pool.create_handler_context(context.mode(), &inner.thread_manager.new_task_sender),
+        );
         Self { inner, context }
     }
 }
@@ -1410,9 +1709,10 @@ impl<TH: TaskHandler> InstalledScheduler for PooledScheduler<TH> {
 
     fn schedule_execution(
         &self,
-        &(transaction, index): &(&SanitizedTransaction, usize),
+        transaction: RuntimeTransaction<SanitizedTransaction>,
+        index: usize,
     ) -> ScheduleResult {
-        let task = SchedulingStateMachine::create_task(transaction.clone(), index, &mut |pubkey| {
+        let task = SchedulingStateMachine::create_task(transaction, index, &mut |pubkey| {
             self.inner.usage_queue_loader.load(pubkey)
         });
         self.inner.thread_manager.send_task(task)
@@ -1437,22 +1737,27 @@ impl<TH: TaskHandler> InstalledScheduler for PooledScheduler<TH> {
     }
 }
 
+impl<S, TH> SchedulerInner for PooledSchedulerInner<S, TH>
+where
+    S: SpawnableScheduler<TH>,
+    TH: TaskHandler,
+{
+    fn id(&self) -> SchedulerId {
+        self.thread_manager.scheduler_id
+    }
+
+    fn is_trashed(&self) -> bool {
+        self.is_aborted() || self.is_overgrown()
+    }
+}
+
 impl<S, TH> UninstalledScheduler for PooledSchedulerInner<S, TH>
 where
-    S: SpawnableScheduler<TH, Inner = PooledSchedulerInner<S, TH>>,
+    S: SpawnableScheduler<TH, Inner = Self>,
     TH: TaskHandler,
 {
     fn return_to_pool(self: Box<Self>) {
-        // Refer to the comment in is_trashed() as to the exact definition of the concept of
-        // _trashed_ and the interaction among different parts of unified scheduler.
-        let should_trash = self.is_trashed();
-        if should_trash {
-            info!("trashing scheduler (id: {})...", self.id());
-        }
-        self.thread_manager
-            .pool
-            .clone()
-            .return_scheduler(*self, should_trash);
+        self.thread_manager.pool.clone().return_scheduler(*self);
     }
 }
 
@@ -1462,6 +1767,17 @@ mod tests {
         super::*,
         crate::sleepless_testing,
         assert_matches::assert_matches,
+        solana_clock::{Slot, MAX_PROCESSING_AGE},
+        solana_hash::Hash,
+        solana_keypair::Keypair,
+        solana_ledger::{
+            blockstore::Blockstore,
+            blockstore_processor::{TransactionStatusBatch, TransactionStatusMessage},
+            create_new_tmp_ledger_auto_delete,
+            leader_schedule_cache::LeaderScheduleCache,
+        },
+        solana_poh::poh_recorder::create_test_recorder_with_index_tracking,
+        solana_pubkey::Pubkey,
         solana_runtime::{
             bank::Bank,
             bank_forks::BankForks,
@@ -1469,18 +1785,15 @@ mod tests {
             installed_scheduler_pool::{BankWithScheduler, SchedulingContext},
             prioritization_fee_cache::PrioritizationFeeCache,
         },
-        solana_sdk::{
-            clock::{Slot, MAX_PROCESSING_AGE},
-            pubkey::Pubkey,
-            signer::keypair::Keypair,
-            system_transaction,
-            transaction::{SanitizedTransaction, TransactionError},
-        },
+        solana_system_transaction as system_transaction,
         solana_timings::ExecuteTimingType,
+        solana_transaction::sanitized::SanitizedTransaction,
+        solana_transaction_error::TransactionError,
         std::{
-            sync::{Arc, RwLock},
+            sync::{atomic::Ordering, Arc, RwLock},
             thread::JoinHandle,
         },
+        test_case::test_matrix,
     };
 
     #[derive(Debug)]
@@ -1530,7 +1843,7 @@ mod tests {
     }
 
     const SHORTENED_POOL_CLEANER_INTERVAL: Duration = Duration::from_millis(1);
-    const SHORTENED_MAX_POOLING_DURATION: Duration = Duration::from_millis(10);
+    const SHORTENED_MAX_POOLING_DURATION: Duration = Duration::from_millis(100);
 
     #[test]
     fn test_scheduler_drop_idle() {
@@ -1575,6 +1888,13 @@ mod tests {
 
         // See the old (= idle) scheduler gone only after solScCleaner did its job...
         sleepless_testing::at(&TestCheckPoint::AfterIdleSchedulerCleaned);
+
+        // The following assertion is racy.
+        //
+        // We need to make sure new_scheduler isn't treated as idle up to now since being returned
+        // to the pool after sleep(SHORTENED_MAX_POOLING_DURATION * 10).
+        // Removing only old_scheduler is the expected behavior. So, make
+        // SHORTENED_MAX_POOLING_DURATION rather long...
         assert_eq!(pool_raw.scheduler_inners.lock().unwrap().len(), 1);
         assert_eq!(
             pool_raw
@@ -1743,9 +2063,8 @@ mod tests {
             fn handle(
                 _result: &mut Result<()>,
                 timings: &mut ExecuteTimings,
-                _bank: &Arc<Bank>,
-                _transaction: &SanitizedTransaction,
-                _index: usize,
+                _bank: &SchedulingContext,
+                _task: &Task,
                 _handler_context: &HandlerContext,
             ) {
                 timings.metrics[ExecuteTimingType::CheckUs] += 123;
@@ -1768,25 +2087,25 @@ mod tests {
         pool.register_timeout_listener(bank.create_timeout_listener());
 
         let tx_before_stale =
-            &SanitizedTransaction::from_transaction_for_tests(system_transaction::transfer(
+            RuntimeTransaction::from_transaction_for_tests(system_transaction::transfer(
                 &mint_keypair,
-                &solana_sdk::pubkey::new_rand(),
+                &solana_pubkey::new_rand(),
                 2,
                 genesis_config.hash(),
             ));
-        bank.schedule_transaction_executions([(tx_before_stale, &0)].into_iter())
+        bank.schedule_transaction_executions([(tx_before_stale, 0)].into_iter())
             .unwrap();
         sleepless_testing::at(TestCheckPoint::BeforeTimeoutListenerTriggered);
 
         sleepless_testing::at(TestCheckPoint::AfterTimeoutListenerTriggered);
         let tx_after_stale =
-            &SanitizedTransaction::from_transaction_for_tests(system_transaction::transfer(
+            RuntimeTransaction::from_transaction_for_tests(system_transaction::transfer(
                 &mint_keypair,
-                &solana_sdk::pubkey::new_rand(),
+                &solana_pubkey::new_rand(),
                 2,
                 genesis_config.hash(),
             ));
-        bank.schedule_transaction_executions([(tx_after_stale, &1)].into_iter())
+        bank.schedule_transaction_executions([(tx_after_stale, 1)].into_iter())
             .unwrap();
 
         // Observe second occurrence of TimeoutListenerTriggered(1), which indicates a new timeout
@@ -1797,7 +2116,7 @@ mod tests {
         let (result, timings) = bank.wait_for_completed_scheduler().unwrap();
         assert_matches!(result, Ok(()));
         // ResultWithTimings should be carried over across active=>stale=>active transitions.
-        assert_eq!(timings.metrics[ExecuteTimingType::CheckUs], 246);
+        assert_eq!(timings.metrics[ExecuteTimingType::CheckUs].0, 246);
     }
 
     #[test]
@@ -1888,26 +2207,26 @@ mod tests {
         pool.register_timeout_listener(bank.create_timeout_listener());
 
         let tx_before_stale =
-            &SanitizedTransaction::from_transaction_for_tests(system_transaction::transfer(
+            RuntimeTransaction::from_transaction_for_tests(system_transaction::transfer(
                 &mint_keypair,
-                &solana_sdk::pubkey::new_rand(),
+                &solana_pubkey::new_rand(),
                 2,
                 genesis_config.hash(),
             ));
-        bank.schedule_transaction_executions([(tx_before_stale, &0)].into_iter())
+        bank.schedule_transaction_executions([(tx_before_stale, 0)].into_iter())
             .unwrap();
         sleepless_testing::at(TestCheckPoint::BeforeTimeoutListenerTriggered);
         sleepless_testing::at(TestCheckPoint::AfterSchedulerThreadAborted);
 
         sleepless_testing::at(TestCheckPoint::AfterTimeoutListenerTriggered);
         let tx_after_stale =
-            &SanitizedTransaction::from_transaction_for_tests(system_transaction::transfer(
+            RuntimeTransaction::from_transaction_for_tests(system_transaction::transfer(
                 &mint_keypair,
-                &solana_sdk::pubkey::new_rand(),
+                &solana_pubkey::new_rand(),
                 2,
                 genesis_config.hash(),
             ));
-        let result = bank.schedule_transaction_executions([(tx_after_stale, &1)].into_iter());
+        let result = bank.schedule_transaction_executions([(tx_after_stale, 1)].into_iter());
         assert_matches!(result, Err(TransactionError::AccountNotFound));
 
         let (result, _timings) = bank.wait_for_completed_scheduler().unwrap();
@@ -1926,9 +2245,8 @@ mod tests {
         fn handle(
             result: &mut Result<()>,
             _timings: &mut ExecuteTimings,
-            _bank: &Arc<Bank>,
-            _transaction: &SanitizedTransaction,
-            _index: usize,
+            _bank: &SchedulingContext,
+            _task: &Task,
             _handler_context: &HandlerContext,
         ) {
             *result = Err(TransactionError::AccountNotFound);
@@ -1952,9 +2270,9 @@ mod tests {
             ..
         } = create_genesis_config(10_000);
 
-        let tx = &SanitizedTransaction::from_transaction_for_tests(system_transaction::transfer(
+        let tx = RuntimeTransaction::from_transaction_for_tests(system_transaction::transfer(
             &mint_keypair,
-            &solana_sdk::pubkey::new_rand(),
+            &solana_pubkey::new_rand(),
             2,
             genesis_config.hash(),
         ));
@@ -1971,7 +2289,7 @@ mod tests {
         );
         let context = SchedulingContext::new(bank.clone());
         let scheduler = pool.do_take_scheduler(context);
-        scheduler.schedule_execution(&(tx, 0)).unwrap();
+        scheduler.schedule_execution(tx, 0).unwrap();
 
         match abort_case {
             AbortCase::Unhandled => {
@@ -2037,9 +2355,8 @@ mod tests {
             fn handle(
                 _result: &mut Result<()>,
                 _timings: &mut ExecuteTimings,
-                _bank: &Arc<Bank>,
-                _transaction: &SanitizedTransaction,
-                _index: usize,
+                _bank: &SchedulingContext,
+                _task: &Task,
                 _handler_context: &HandlerContext,
             ) {
                 *TASK_COUNT.lock().unwrap() += 1;
@@ -2065,22 +2382,29 @@ mod tests {
         let context = SchedulingContext::new(bank.clone());
         let scheduler = pool.do_take_scheduler(context);
 
-        for i in 0..10 {
-            let tx =
-                &SanitizedTransaction::from_transaction_for_tests(system_transaction::transfer(
-                    &mint_keypair,
-                    &solana_sdk::pubkey::new_rand(),
-                    2,
-                    genesis_config.hash(),
-                ));
-            scheduler.schedule_execution(&(tx, i)).unwrap();
+        // This test is racy.
+        //
+        // That's because the scheduler needs to be aborted quickly as an expected behavior,
+        // leaving some readily-available work untouched. So, schedule rather large number of tasks
+        // to make the short-cutting abort code-path win the race easily.
+        const MAX_TASK_COUNT: usize = 100;
+
+        for i in 0..MAX_TASK_COUNT {
+            let tx = RuntimeTransaction::from_transaction_for_tests(system_transaction::transfer(
+                &mint_keypair,
+                &solana_pubkey::new_rand(),
+                2,
+                genesis_config.hash(),
+            ));
+            scheduler.schedule_execution(tx, i).unwrap();
         }
 
         // Make sure ThreadManager::drop() is properly short-circuiting for non-aborting scheduler.
         sleepless_testing::at(TestCheckPoint::BeforeThreadManagerDrop);
         drop::<PooledScheduler<_>>(scheduler);
         sleepless_testing::at(TestCheckPoint::AfterSchedulerThreadAborted);
-        assert!(*TASK_COUNT.lock().unwrap() < 10);
+        // All of handler threads should have been aborted before processing MAX_TASK_COUNT tasks.
+        assert!(*TASK_COUNT.lock().unwrap() < MAX_TASK_COUNT);
     }
 
     #[test]
@@ -2101,10 +2425,10 @@ mod tests {
 
         let (result_with_timings, scheduler1) = scheduler1.into_inner();
         assert_matches!(result_with_timings, (Ok(()), _));
-        pool.return_scheduler(scheduler1, false);
+        pool.return_scheduler(scheduler1);
         let (result_with_timings, scheduler2) = scheduler2.into_inner();
         assert_matches!(result_with_timings, (Ok(()), _));
-        pool.return_scheduler(scheduler2, false);
+        pool.return_scheduler(scheduler2);
 
         let scheduler3 = pool.do_take_scheduler(context.clone());
         assert_eq!(scheduler_id2, scheduler3.id());
@@ -2147,7 +2471,7 @@ mod tests {
 
         let scheduler = pool.do_take_scheduler(old_context.clone());
         let scheduler_id = scheduler.id();
-        pool.return_scheduler(scheduler.into_inner().1, false);
+        pool.return_scheduler(scheduler.into_inner().1);
 
         let scheduler = pool.take_scheduler(new_context.clone());
         assert_eq!(scheduler_id, scheduler.id());
@@ -2217,9 +2541,9 @@ mod tests {
             mint_keypair,
             ..
         } = create_genesis_config(10_000);
-        let tx0 = &SanitizedTransaction::from_transaction_for_tests(system_transaction::transfer(
+        let tx0 = RuntimeTransaction::from_transaction_for_tests(system_transaction::transfer(
             &mint_keypair,
-            &solana_sdk::pubkey::new_rand(),
+            &solana_pubkey::new_rand(),
             2,
             genesis_config.hash(),
         ));
@@ -2232,7 +2556,7 @@ mod tests {
 
         assert_eq!(bank.transaction_count(), 0);
         let scheduler = pool.take_scheduler(context);
-        scheduler.schedule_execution(&(tx0, 0)).unwrap();
+        scheduler.schedule_execution(tx0, 0).unwrap();
         let bank = BankWithScheduler::new(bank, Some(scheduler));
         assert_matches!(bank.wait_for_completed_scheduler(), Some((Ok(()), _)));
         assert_eq!(bank.transaction_count(), 1);
@@ -2277,28 +2601,27 @@ mod tests {
         let scheduler = pool.take_scheduler(context);
 
         let unfunded_keypair = Keypair::new();
-        let bad_tx =
-            &SanitizedTransaction::from_transaction_for_tests(system_transaction::transfer(
-                &unfunded_keypair,
-                &solana_sdk::pubkey::new_rand(),
-                2,
-                genesis_config.hash(),
-            ));
+        let bad_tx = RuntimeTransaction::from_transaction_for_tests(system_transaction::transfer(
+            &unfunded_keypair,
+            &solana_pubkey::new_rand(),
+            2,
+            genesis_config.hash(),
+        ));
         assert_eq!(bank.transaction_count(), 0);
-        scheduler.schedule_execution(&(bad_tx, 0)).unwrap();
+        scheduler.schedule_execution(bad_tx, 0).unwrap();
         sleepless_testing::at(TestCheckPoint::AfterTaskHandled);
         assert_eq!(bank.transaction_count(), 0);
 
         let good_tx_after_bad_tx =
-            &SanitizedTransaction::from_transaction_for_tests(system_transaction::transfer(
+            RuntimeTransaction::from_transaction_for_tests(system_transaction::transfer(
                 &mint_keypair,
-                &solana_sdk::pubkey::new_rand(),
+                &solana_pubkey::new_rand(),
                 3,
                 genesis_config.hash(),
             ));
         // make sure this tx is really a good one to execute.
         assert_matches!(
-            bank.simulate_transaction_unchecked(good_tx_after_bad_tx, false)
+            bank.simulate_transaction_unchecked(&good_tx_after_bad_tx, false)
                 .result,
             Ok(_)
         );
@@ -2306,7 +2629,7 @@ mod tests {
         let bank = BankWithScheduler::new(bank, Some(scheduler));
         if extra_tx_after_failure {
             assert_matches!(
-                bank.schedule_transaction_executions([(good_tx_after_bad_tx, &1)].into_iter()),
+                bank.schedule_transaction_executions([(good_tx_after_bad_tx, 1)].into_iter()),
                 Err(TransactionError::AccountNotFound)
             );
         }
@@ -2368,11 +2691,11 @@ mod tests {
             fn handle(
                 _result: &mut Result<()>,
                 _timings: &mut ExecuteTimings,
-                _bank: &Arc<Bank>,
-                _transaction: &SanitizedTransaction,
-                index: usize,
+                _bank: &SchedulingContext,
+                task: &Task,
                 _handler_context: &HandlerContext,
             ) {
+                let index = task.task_index();
                 if index == 0 {
                     sleepless_testing::at(PanickingHanlderCheckPoint::BeforeNotifiedPanic);
                 } else if index == 1 {
@@ -2408,14 +2731,13 @@ mod tests {
 
         for index in 0..TX_COUNT {
             // Use 2 non-conflicting txes to exercise the channel disconnected case as well.
-            let tx =
-                &SanitizedTransaction::from_transaction_for_tests(system_transaction::transfer(
-                    &Keypair::new(),
-                    &solana_sdk::pubkey::new_rand(),
-                    1,
-                    genesis_config.hash(),
-                ));
-            scheduler.schedule_execution(&(tx, index)).unwrap();
+            let tx = RuntimeTransaction::from_transaction_for_tests(system_transaction::transfer(
+                &Keypair::new(),
+                &solana_pubkey::new_rand(),
+                1,
+                genesis_config.hash(),
+            ));
+            scheduler.schedule_execution(tx, index).unwrap();
         }
         // finally unblock the scheduler thread; otherwise the above schedule_execution could
         // return SchedulerAborted...
@@ -2449,11 +2771,11 @@ mod tests {
             fn handle(
                 result: &mut Result<()>,
                 _timings: &mut ExecuteTimings,
-                _bank: &Arc<Bank>,
-                _transaction: &SanitizedTransaction,
-                index: usize,
+                _bank: &SchedulingContext,
+                task: &Task,
                 _handler_context: &HandlerContext,
             ) {
+                let index = task.task_index();
                 *TASK_COUNT.lock().unwrap() += 1;
                 if index == 1 {
                     *result = Err(TransactionError::AccountNotFound);
@@ -2482,14 +2804,13 @@ mod tests {
         let scheduler = pool.do_take_scheduler(context);
 
         for i in 0..10 {
-            let tx =
-                &SanitizedTransaction::from_transaction_for_tests(system_transaction::transfer(
-                    &mint_keypair,
-                    &solana_sdk::pubkey::new_rand(),
-                    2,
-                    genesis_config.hash(),
-                ));
-            scheduler.schedule_execution(&(tx, i)).unwrap();
+            let tx = RuntimeTransaction::from_transaction_for_tests(system_transaction::transfer(
+                &mint_keypair,
+                &solana_pubkey::new_rand(),
+                2,
+                genesis_config.hash(),
+            ));
+            scheduler.schedule_execution(tx, i).unwrap();
         }
         // finally unblock the scheduler thread; otherwise the above schedule_execution could
         // return SchedulerAborted...
@@ -2519,24 +2840,17 @@ mod tests {
             fn handle(
                 result: &mut Result<()>,
                 timings: &mut ExecuteTimings,
-                bank: &Arc<Bank>,
-                transaction: &SanitizedTransaction,
-                index: usize,
+                bank: &SchedulingContext,
+                task: &Task,
                 handler_context: &HandlerContext,
             ) {
+                let index = task.task_index();
                 match index {
                     STALLED_TRANSACTION_INDEX => *LOCK_TO_STALL.lock().unwrap(),
                     BLOCKED_TRANSACTION_INDEX => {}
                     _ => unreachable!(),
                 };
-                DefaultTaskHandler::handle(
-                    result,
-                    timings,
-                    bank,
-                    transaction,
-                    index,
-                    handler_context,
-                );
+                DefaultTaskHandler::handle(result, timings, bank, task, handler_context);
             }
         }
 
@@ -2547,15 +2861,15 @@ mod tests {
         } = create_genesis_config(10_000);
 
         // tx0 and tx1 is definitely conflicting to write-lock the mint address
-        let tx0 = &SanitizedTransaction::from_transaction_for_tests(system_transaction::transfer(
+        let tx0 = RuntimeTransaction::from_transaction_for_tests(system_transaction::transfer(
             &mint_keypair,
-            &solana_sdk::pubkey::new_rand(),
+            &solana_pubkey::new_rand(),
             2,
             genesis_config.hash(),
         ));
-        let tx1 = &SanitizedTransaction::from_transaction_for_tests(system_transaction::transfer(
+        let tx1 = RuntimeTransaction::from_transaction_for_tests(system_transaction::transfer(
             &mint_keypair,
-            &solana_sdk::pubkey::new_rand(),
+            &solana_pubkey::new_rand(),
             2,
             genesis_config.hash(),
         ));
@@ -2578,10 +2892,10 @@ mod tests {
         // Stall handling tx0 and tx1
         let lock_to_stall = LOCK_TO_STALL.lock().unwrap();
         scheduler
-            .schedule_execution(&(tx0, STALLED_TRANSACTION_INDEX))
+            .schedule_execution(tx0, STALLED_TRANSACTION_INDEX)
             .unwrap();
         scheduler
-            .schedule_execution(&(tx1, BLOCKED_TRANSACTION_INDEX))
+            .schedule_execution(tx1, BLOCKED_TRANSACTION_INDEX)
             .unwrap();
 
         // Wait a bit for the scheduler thread to decide to block tx1
@@ -2604,13 +2918,12 @@ mod tests {
             fn handle(
                 _result: &mut Result<()>,
                 _timings: &mut ExecuteTimings,
-                bank: &Arc<Bank>,
-                _transaction: &SanitizedTransaction,
-                index: usize,
+                context: &SchedulingContext,
+                task: &Task,
                 _handler_context: &HandlerContext,
             ) {
                 // The task index must always be matched to the slot.
-                assert_eq!(index as Slot, bank.slot());
+                assert_eq!(task.task_index() as Slot, context.bank().slot());
             }
         }
 
@@ -2640,9 +2953,9 @@ mod tests {
 
         // Create a dummy tx and two contexts
         let dummy_tx =
-            &SanitizedTransaction::from_transaction_for_tests(system_transaction::transfer(
+            RuntimeTransaction::from_transaction_for_tests(system_transaction::transfer(
                 &mint_keypair,
-                &solana_sdk::pubkey::new_rand(),
+                &solana_pubkey::new_rand(),
                 2,
                 genesis_config.hash(),
             ));
@@ -2656,7 +2969,9 @@ mod tests {
             .take(10000)
         {
             let scheduler = pool.take_scheduler(context.clone());
-            scheduler.schedule_execution(&(dummy_tx, index)).unwrap();
+            scheduler
+                .schedule_execution(dummy_tx.clone(), index)
+                .unwrap();
             scheduler.wait_for_termination(false).1.return_to_pool();
         }
     }
@@ -2698,9 +3013,9 @@ mod tests {
 
         fn schedule_execution(
             &self,
-            &(transaction, index): &(&SanitizedTransaction, usize),
+            transaction: RuntimeTransaction<SanitizedTransaction>,
+            index: usize,
         ) -> ScheduleResult {
-            let transaction_and_index = (transaction.clone(), index);
             let context = self.context().clone();
             let pool = self.3.clone();
 
@@ -2712,13 +3027,19 @@ mod tests {
                 let mut result = Ok(());
                 let mut timings = ExecuteTimings::default();
 
+                let task = SchedulingStateMachine::create_task(transaction, index, &mut |_| {
+                    UsageQueue::default()
+                });
+
                 <DefaultTaskHandler as TaskHandler>::handle(
                     &mut result,
                     &mut timings,
-                    context.bank(),
-                    &transaction_and_index.0,
-                    transaction_and_index.1,
-                    &pool.handler_context,
+                    &context,
+                    &task,
+                    &pool.create_handler_context(
+                        BlockVerification,
+                        &crossbeam_channel::unbounded().0,
+                    ),
                 );
                 (result, timings)
             }));
@@ -2752,11 +3073,21 @@ mod tests {
         }
     }
 
+    impl<const TRIGGER_RACE_CONDITION: bool> SchedulerInner for AsyncScheduler<TRIGGER_RACE_CONDITION> {
+        fn id(&self) -> SchedulerId {
+            42
+        }
+
+        fn is_trashed(&self) -> bool {
+            false
+        }
+    }
+
     impl<const TRIGGER_RACE_CONDITION: bool> UninstalledScheduler
         for AsyncScheduler<TRIGGER_RACE_CONDITION>
     {
         fn return_to_pool(self: Box<Self>) {
-            self.3.clone().return_scheduler(*self, false)
+            self.3.clone().return_scheduler(*self)
         }
     }
 
@@ -2803,9 +3134,9 @@ mod tests {
             ..
         } = create_genesis_config(10_000);
         let very_old_valid_tx =
-            SanitizedTransaction::from_transaction_for_tests(system_transaction::transfer(
+            RuntimeTransaction::from_transaction_for_tests(system_transaction::transfer(
                 &mint_keypair,
-                &solana_sdk::pubkey::new_rand(),
+                &solana_pubkey::new_rand(),
                 2,
                 genesis_config.hash(),
             ));
@@ -2838,7 +3169,7 @@ mod tests {
         assert_eq!(bank.transaction_count(), 0);
 
         // schedule but not immediately execute transaction
-        bank.schedule_transaction_executions([(&very_old_valid_tx, &0)].into_iter())
+        bank.schedule_transaction_executions([(very_old_valid_tx, 0)].into_iter())
             .unwrap();
         // this calls register_recent_blockhash internally
         bank.fill_bank_with_ticks_for_tests();
@@ -2895,26 +3226,170 @@ mod tests {
 
         let mut tx = system_transaction::transfer(
             mint_keypair,
-            &solana_sdk::pubkey::new_rand(),
+            &solana_pubkey::new_rand(),
             2,
             genesis_config.hash(),
         );
         // mangle the transfer tx to try to lock fee_payer (= mint_keypair) address twice!
         tx.message.account_keys.push(tx.message.account_keys[0]);
-        let tx = &SanitizedTransaction::from_transaction_for_tests(tx);
+        let tx = RuntimeTransaction::from_transaction_for_tests(tx);
 
         // this internally should call SanitizedTransaction::get_account_locks().
         let result = &mut Ok(());
         let timings = &mut ExecuteTimings::default();
         let prioritization_fee_cache = Arc::new(PrioritizationFeeCache::new(0u64));
+        let scheduling_context = &SchedulingContext::new(bank.clone());
         let handler_context = &HandlerContext {
             log_messages_bytes_limit: None,
             transaction_status_sender: None,
             replay_vote_sender: None,
             prioritization_fee_cache,
+            banking_packet_receiver: never(),
+            banking_packet_handler: Box::new(|_, _| {}),
+            banking_stage_helper: None,
+            transaction_recorder: None,
         };
 
-        DefaultTaskHandler::handle(result, timings, bank, tx, 0, handler_context);
+        let task = SchedulingStateMachine::create_task(tx, 0, &mut |_| UsageQueue::default());
+        DefaultTaskHandler::handle(result, timings, scheduling_context, &task, handler_context);
         assert_matches!(result, Err(TransactionError::AccountLoadedTwice));
+    }
+
+    enum TxResult {
+        ExecutedWithSuccess,
+        ExecutedWithFailure,
+        NotExecuted,
+    }
+
+    #[test_matrix(
+        [TxResult::ExecutedWithSuccess, TxResult::ExecutedWithFailure, TxResult::NotExecuted],
+        [false, true]
+    )]
+    fn test_task_handler_poh_recording(tx_result: TxResult, should_succeed_to_record_to_poh: bool) {
+        solana_logger::setup();
+
+        let GenesisConfigInfo {
+            genesis_config,
+            ref mint_keypair,
+            ..
+        } = solana_ledger::genesis_utils::create_genesis_config(10_000);
+        let bank = Bank::new_for_tests(&genesis_config);
+        let bank_forks = BankForks::new_rw_arc(bank);
+        let bank = bank_forks.read().unwrap().working_bank_with_scheduler();
+
+        let (tx, expected_tx_result) = match tx_result {
+            TxResult::ExecutedWithSuccess => (
+                system_transaction::transfer(
+                    mint_keypair,
+                    &solana_pubkey::new_rand(),
+                    1,
+                    genesis_config.hash(),
+                ),
+                Ok(()),
+            ),
+            TxResult::ExecutedWithFailure => (
+                system_transaction::transfer(
+                    mint_keypair,
+                    &solana_pubkey::new_rand(),
+                    1_000_000,
+                    genesis_config.hash(),
+                ),
+                Ok(()),
+            ),
+            TxResult::NotExecuted => (
+                system_transaction::transfer(
+                    mint_keypair,
+                    &solana_pubkey::new_rand(),
+                    1,
+                    Hash::default(),
+                ),
+                Err(TransactionError::BlockhashNotFound),
+            ),
+        };
+        let tx = RuntimeTransaction::from_transaction_for_tests(tx);
+
+        let result = &mut Ok(());
+        let timings = &mut ExecuteTimings::default();
+        let prioritization_fee_cache = Arc::new(PrioritizationFeeCache::new(0u64));
+        let scheduling_context = &SchedulingContext::for_production(bank.clone());
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let (ledger_path, _blockhash) = create_new_tmp_ledger_auto_delete!(&genesis_config);
+        let blockstore = Arc::new(Blockstore::open(ledger_path.path()).unwrap());
+        let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(&bank));
+        let (exit, poh_recorder, poh_service, signal_receiver) =
+            create_test_recorder_with_index_tracking(
+                bank.clone(),
+                blockstore.clone(),
+                None,
+                Some(leader_schedule_cache),
+            );
+        let handler_context = &HandlerContext {
+            log_messages_bytes_limit: None,
+            transaction_status_sender: Some(TransactionStatusSender { sender }),
+            replay_vote_sender: None,
+            prioritization_fee_cache,
+            banking_packet_receiver: never(),
+            banking_packet_handler: Box::new(|_, _| {}),
+            banking_stage_helper: None,
+            transaction_recorder: Some(poh_recorder.read().unwrap().new_recorder()),
+        };
+
+        let task =
+            SchedulingStateMachine::create_task(tx.clone(), 0, &mut |_| UsageQueue::default());
+
+        // wait until the poh's working bank is cleared.
+        // also flush signal_receiver after that.
+        if !should_succeed_to_record_to_poh {
+            while poh_recorder.read().unwrap().bank().is_some() {
+                sleep(Duration::from_millis(100));
+            }
+            while signal_receiver.try_recv().is_ok() {}
+        }
+
+        assert_eq!(bank.transaction_count(), 0);
+        assert_eq!(bank.transaction_error_count(), 0);
+        DefaultTaskHandler::handle(result, timings, scheduling_context, &task, handler_context);
+
+        if should_succeed_to_record_to_poh {
+            if expected_tx_result.is_ok() {
+                assert_matches!(result, Ok(()));
+                assert_eq!(bank.transaction_count(), 1);
+                if matches!(tx_result, TxResult::ExecutedWithFailure) {
+                    assert_eq!(bank.transaction_error_count(), 1);
+                } else {
+                    assert_eq!(bank.transaction_error_count(), 0);
+                }
+                assert_matches!(
+                    receiver.try_recv(),
+                    Ok(TransactionStatusMessage::Batch(
+                        TransactionStatusBatch { .. }
+                    ))
+                );
+                assert_matches!(
+                    signal_receiver.try_recv(),
+                    Ok((_, (solana_entry::entry::Entry {transactions, ..} , _)))
+                        if transactions == vec![tx.to_versioned_transaction()]
+                );
+            } else {
+                assert_eq!(result, &expected_tx_result);
+                assert_eq!(bank.transaction_count(), 0);
+                assert_eq!(bank.transaction_error_count(), 0);
+                assert_matches!(receiver.try_recv(), Err(_));
+                assert_matches!(signal_receiver.try_recv(), Err(_));
+            }
+        } else {
+            if expected_tx_result.is_ok() {
+                assert_matches!(result, Err(TransactionError::CommitCancelled));
+            } else {
+                assert_eq!(result, &expected_tx_result);
+            }
+
+            assert_eq!(bank.transaction_count(), 0);
+            assert_matches!(receiver.try_recv(), Err(_));
+            assert_matches!(signal_receiver.try_recv(), Err(_));
+        }
+
+        exit.store(true, Ordering::Relaxed);
+        poh_service.join().unwrap();
     }
 }

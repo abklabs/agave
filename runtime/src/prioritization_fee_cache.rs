@@ -1,13 +1,13 @@
 use {
     crate::{bank::Bank, prioritization_fee::*},
-    crossbeam_channel::{unbounded, Receiver, Sender},
+    crossbeam_channel::{unbounded, Receiver, Sender, TryRecvError},
     log::*,
+    solana_accounts_db::account_locks::validate_account_locks,
     solana_measure::measure_us,
-    solana_runtime_transaction::instructions_processor::process_compute_budget_instructions,
+    solana_runtime_transaction::transaction_with_meta::TransactionWithMeta,
     solana_sdk::{
         clock::{BankId, Slot},
         pubkey::Pubkey,
-        transaction::SanitizedTransaction,
     },
     std::{
         collections::{BTreeMap, HashMap},
@@ -15,7 +15,8 @@ use {
             atomic::{AtomicU64, Ordering},
             Arc, RwLock,
         },
-        thread::{Builder, JoinHandle},
+        thread::{sleep, Builder, JoinHandle},
+        time::Duration,
     },
 };
 
@@ -193,7 +194,11 @@ impl PrioritizationFeeCache {
     /// Update with a list of non-vote transactions' compute_budget_details and account_locks; Only
     /// transactions have both valid compute_budget_details and account_locks will be used to update
     /// fee_cache asynchronously.
-    pub fn update<'a>(&self, bank: &Bank, txs: impl Iterator<Item = &'a SanitizedTransaction>) {
+    pub fn update<'a, Tx: TransactionWithMeta + 'a>(
+        &self,
+        bank: &Bank,
+        txs: impl Iterator<Item = &'a Tx>,
+    ) {
         let (_, send_updates_us) = measure_us!({
             for sanitized_transaction in txs {
                 // Vote transactions are not prioritized, therefore they are excluded from
@@ -202,13 +207,16 @@ impl PrioritizationFeeCache {
                     continue;
                 }
 
-                let compute_budget_limits = process_compute_budget_instructions(
-                    sanitized_transaction.message().program_instructions_iter(),
-                );
-                let account_locks = sanitized_transaction
-                    .get_account_locks(bank.get_transaction_account_lock_limit());
+                let compute_budget_limits = sanitized_transaction
+                    .compute_budget_instruction_details()
+                    .sanitize_and_convert_to_compute_budget_limits(&bank.feature_set);
 
-                if compute_budget_limits.is_err() || account_locks.is_err() {
+                let lock_result = validate_account_locks(
+                    sanitized_transaction.account_keys(),
+                    bank.get_transaction_account_lock_limit(),
+                );
+
+                if compute_budget_limits.is_err() || lock_result.is_err() {
                     continue;
                 }
                 let compute_budget_limits = compute_budget_limits.unwrap();
@@ -219,12 +227,13 @@ impl PrioritizationFeeCache {
                     continue;
                 }
 
-                let writable_accounts = account_locks
-                    .unwrap()
-                    .writable
+                let writable_accounts = sanitized_transaction
+                    .account_keys()
                     .iter()
-                    .map(|key| **key)
-                    .collect::<Vec<_>>();
+                    .enumerate()
+                    .filter(|(index, _)| sanitized_transaction.is_writable(*index))
+                    .map(|(_, key)| *key)
+                    .collect();
 
                 self.sender
                     .send(CacheServiceUpdate::TransactionUpdate {
@@ -351,7 +360,18 @@ impl PrioritizationFeeCache {
         // for a slot. The updates are tracked and finalized by bank_id.
         let mut unfinalized = UnfinalizedPrioritizationFees::new();
 
-        for update in receiver.iter() {
+        loop {
+            let update = match receiver.try_recv() {
+                Ok(update) => update,
+                Err(TryRecvError::Empty) => {
+                    sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(err @ TryRecvError::Disconnected) => {
+                    info!("PrioritizationFeeCache::service_loop() is stopping because: {err}");
+                    break;
+                }
+            };
             match update {
                 CacheServiceUpdate::TransactionUpdate {
                     slot,
@@ -420,6 +440,7 @@ mod tests {
             bank_forks::BankForks,
             genesis_utils::{create_genesis_config, GenesisConfigInfo},
         },
+        solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
         solana_sdk::{
             compute_budget::ComputeBudgetInstruction,
             message::Message,
@@ -433,7 +454,7 @@ mod tests {
         compute_unit_price: u64,
         signer_account: &Pubkey,
         write_account: &Pubkey,
-    ) -> SanitizedTransaction {
+    ) -> RuntimeTransaction<SanitizedTransaction> {
         let transaction = Transaction::new_unsigned(Message::new(
             &[
                 system_instruction::transfer(signer_account, write_account, 1),
@@ -442,14 +463,14 @@ mod tests {
             Some(signer_account),
         ));
 
-        SanitizedTransaction::from_transaction_for_tests(transaction)
+        RuntimeTransaction::from_transaction_for_tests(transaction)
     }
 
     // update fee cache is asynchronous, this test helper blocks until update is completed.
     fn sync_update<'a>(
         prioritization_fee_cache: &PrioritizationFeeCache,
         bank: Arc<Bank>,
-        txs: impl ExactSizeIterator<Item = &'a SanitizedTransaction>,
+        txs: impl ExactSizeIterator<Item = &'a RuntimeTransaction<SanitizedTransaction>>,
     ) {
         let expected_update_count = prioritization_fee_cache
             .metrics
@@ -547,7 +568,7 @@ mod tests {
         let bank0 = Bank::new_for_benches(&genesis_config);
         let bank_forks = BankForks::new_rw_arc(bank0);
         let bank = bank_forks.read().unwrap().working_bank();
-        let collector = solana_sdk::pubkey::new_rand();
+        let collector = solana_pubkey::new_rand();
 
         let bank1 = Arc::new(Bank::new_from_parent(bank.clone(), &collector, 1));
         sync_update(
@@ -599,7 +620,7 @@ mod tests {
         let bank0 = Bank::new_for_benches(&genesis_config);
         let bank_forks = BankForks::new_rw_arc(bank0);
         let bank = bank_forks.read().unwrap().working_bank();
-        let collector = solana_sdk::pubkey::new_rand();
+        let collector = solana_pubkey::new_rand();
         let bank1 = Arc::new(Bank::new_from_parent(bank.clone(), &collector, 1));
         let bank2 = Arc::new(Bank::new_from_parent(bank.clone(), &collector, 2));
         let bank3 = Arc::new(Bank::new_from_parent(bank, &collector, 3));
@@ -851,7 +872,7 @@ mod tests {
         let bank0 = Bank::new_for_benches(&genesis_config);
         let bank_forks = BankForks::new_rw_arc(bank0);
         let bank = bank_forks.read().unwrap().working_bank();
-        let collector = solana_sdk::pubkey::new_rand();
+        let collector = solana_pubkey::new_rand();
         let slot: Slot = 999;
         let bank1 = Arc::new(Bank::new_from_parent(bank.clone(), &collector, slot));
         let bank2 = Arc::new(Bank::new_from_parent(bank, &collector, slot + 1));

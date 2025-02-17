@@ -3,11 +3,9 @@
 /// In addition, the dynamic library must export a "C" function _create_plugin which
 /// creates the implementation of the plugin.
 use {
-    solana_sdk::{
-        clock::{Slot, UnixTimestamp},
-        signature::Signature,
-        transaction::SanitizedTransaction,
-    },
+    solana_clock::{Slot, UnixTimestamp},
+    solana_signature::Signature,
+    solana_transaction::sanitized::SanitizedTransaction,
     solana_transaction_status::{Reward, RewardsAndNumPartitions, TransactionStatusMeta},
     std::{any::Any, error, io},
     thiserror::Error,
@@ -306,7 +304,7 @@ pub enum GeyserPluginError {
 }
 
 /// The current status of a slot
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[repr(u32)]
 pub enum SlotStatus {
     /// The highest slot of the heaviest fork processed by the node. Ledger state at this slot is
@@ -319,6 +317,18 @@ pub enum SlotStatus {
 
     /// The highest slot that has been voted on by supermajority of the cluster, ie. is confirmed.
     Confirmed,
+
+    /// First Shred Received
+    FirstShredReceived,
+
+    /// All shreds for the slot have been received.
+    Completed,
+
+    /// A new bank fork is created with the slot
+    CreatedBank,
+
+    /// A slot is marked dead
+    Dead(String),
 }
 
 impl SlotStatus {
@@ -327,6 +337,10 @@ impl SlotStatus {
             SlotStatus::Confirmed => "confirmed",
             SlotStatus::Processed => "processed",
             SlotStatus::Rooted => "rooted",
+            SlotStatus::FirstShredReceived => "first_shred_received",
+            SlotStatus::Completed => "completed",
+            SlotStatus::CreatedBank => "created_bank",
+            SlotStatus::Dead(_error) => "dead",
         }
     }
 }
@@ -407,7 +421,7 @@ pub trait GeyserPlugin: Any + Send + Sync + std::fmt::Debug {
         &self,
         slot: Slot,
         parent: Option<u64>,
-        status: SlotStatus,
+        status: &SlotStatus,
     ) -> Result<()> {
         Ok(())
     }
@@ -438,6 +452,14 @@ pub trait GeyserPlugin: Any + Send + Sync + std::fmt::Debug {
     /// Default is true -- if the plugin is not interested in
     /// account data, please return false.
     fn account_data_notifications_enabled(&self) -> bool {
+        true
+    }
+
+    /// Check if the plugin is interested in account data from snapshot
+    /// Default is true -- if the plugin is not interested in
+    /// account data snapshot, please return false because startup would be
+    /// improved significantly.
+    fn account_data_snapshot_notifications_enabled(&self) -> bool {
         true
     }
 

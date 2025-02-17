@@ -38,10 +38,12 @@ env:
 
 jobs:
   test:
+    #if: github.repository == 'anza-xyz/agave'
+    if: false # restore once all program-specific repos are ready
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        version: ["v0.29.0", "v0.30.0"]
+        version: ["master"]
     steps:
       - uses: actions/checkout@v4
 
@@ -49,9 +51,9 @@ jobs:
         run: |
           .github/scripts/purge-ubuntu-runner.sh
 
-      - uses: mozilla-actions/sccache-action@v0.0.4
+      - uses: mozilla-actions/sccache-action@v0.0.5
         with:
-          version: "v0.8.1"
+          version: "v0.9.1"
 
       - shell: bash
         run: |

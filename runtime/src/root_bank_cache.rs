@@ -11,6 +11,7 @@ use {
 };
 
 /// Cached root bank that only loads from bank forks if the root has been updated.
+#[derive(Clone)]
 pub struct RootBankCache {
     bank_forks: Arc<RwLock<BankForks>>,
     cached_root_bank: Weak<Bank>,
@@ -53,7 +54,7 @@ mod tests {
             bank_forks::BankForks,
             genesis_utils::{create_genesis_config, GenesisConfigInfo},
         },
-        solana_sdk::pubkey::Pubkey,
+        solana_pubkey::Pubkey,
     };
 
     #[test]

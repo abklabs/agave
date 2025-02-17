@@ -1,20 +1,19 @@
-#![cfg_attr(RUSTC_WITH_SPECIALIZATION, feature(min_specialization))]
+#![cfg_attr(feature = "frozen-abi", feature(min_specialization))]
 #![allow(clippy::arithmetic_side_effects)]
 #[deprecated(
     since = "1.8.0",
-    note = "Please use `solana_sdk::stake::program::id` or `solana_program::stake::program::id` instead"
+    note = "Please use `solana_sdk_ids::sysvar::stake::id` instead"
 )]
-pub use solana_sdk::stake::program::{check_id, id};
-use solana_sdk::{
-    feature_set::{self, FeatureSet},
-    genesis_config::GenesisConfig,
-    native_token::LAMPORTS_PER_SOL,
+pub use solana_sdk_ids::stake::{check_id, id};
+use {
+    solana_feature_set::{self as feature_set, FeatureSet},
+    solana_genesis_config::GenesisConfig,
+    solana_native_token::LAMPORTS_PER_SOL,
 };
 
 pub mod config;
+#[deprecated(since = "2.2.0")]
 pub mod points;
-#[doc(hidden)]
-pub mod rewards;
 pub mod stake_instruction;
 pub mod stake_state;
 

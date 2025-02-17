@@ -1,13 +1,9 @@
 //! Plain Old Data types for the ElGamal encryption scheme.
 
-use {
-    crate::encryption::{
-        pod::impl_from_str, DECRYPT_HANDLE_LEN, ELGAMAL_CIPHERTEXT_LEN, ELGAMAL_PUBKEY_LEN,
-    },
-    base64::{prelude::BASE64_STANDARD, Engine},
-    bytemuck::Zeroable,
-    std::fmt,
-};
+#[cfg(not(target_arch = "wasm32"))]
+use bytemuck::Zeroable;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::prelude::*;
 #[cfg(not(target_os = "solana"))]
 use {
     crate::{
@@ -16,6 +12,14 @@ use {
     },
     curve25519_dalek::ristretto::CompressedRistretto,
 };
+use {
+    crate::{
+        encryption::{DECRYPT_HANDLE_LEN, ELGAMAL_CIPHERTEXT_LEN, ELGAMAL_PUBKEY_LEN},
+        pod::{impl_from_bytes, impl_from_str, impl_wasm_bindings},
+    },
+    base64::{prelude::BASE64_STANDARD, Engine},
+    std::fmt,
+};
 
 /// Maximum length of a base64 encoded ElGamal public key
 const ELGAMAL_PUBKEY_MAX_BASE64_LEN: usize = 44;
@@ -23,10 +27,19 @@ const ELGAMAL_PUBKEY_MAX_BASE64_LEN: usize = 44;
 /// Maximum length of a base64 encoded ElGamal ciphertext
 const ELGAMAL_CIPHERTEXT_MAX_BASE64_LEN: usize = 88;
 
+/// Maximum length of a base64 encoded ElGamal decrypt handle
+const DECRYPT_HANDLE_MAX_BASE64_LEN: usize = 44;
+
 /// The `ElGamalCiphertext` type as a `Pod`.
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 #[derive(Clone, Copy, bytemuck_derive::Pod, bytemuck_derive::Zeroable, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct PodElGamalCiphertext(pub(crate) [u8; ELGAMAL_CIPHERTEXT_LEN]);
+
+impl_wasm_bindings!(
+    POD_TYPE = PodElGamalCiphertext,
+    DECODED_TYPE = ElGamalCiphertext
+);
 
 impl fmt::Debug for PodElGamalCiphertext {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -52,6 +65,11 @@ impl_from_str!(
     BASE64_LEN = ELGAMAL_CIPHERTEXT_MAX_BASE64_LEN
 );
 
+impl_from_bytes!(
+    TYPE = PodElGamalCiphertext,
+    BYTES_LEN = ELGAMAL_CIPHERTEXT_LEN
+);
+
 #[cfg(not(target_os = "solana"))]
 impl From<ElGamalCiphertext> for PodElGamalCiphertext {
     fn from(decoded_ciphertext: ElGamalCiphertext) -> Self {
@@ -69,9 +87,12 @@ impl TryFrom<PodElGamalCiphertext> for ElGamalCiphertext {
 }
 
 /// The `ElGamalPubkey` type as a `Pod`.
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 #[derive(Clone, Copy, Default, bytemuck_derive::Pod, bytemuck_derive::Zeroable, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct PodElGamalPubkey(pub(crate) [u8; ELGAMAL_PUBKEY_LEN]);
+
+impl_wasm_bindings!(POD_TYPE = PodElGamalPubkey, DECODED_TYPE = ElGamalPubkey);
 
 impl fmt::Debug for PodElGamalPubkey {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -90,6 +111,8 @@ impl_from_str!(
     BYTES_LEN = ELGAMAL_PUBKEY_LEN,
     BASE64_LEN = ELGAMAL_PUBKEY_MAX_BASE64_LEN
 );
+
+impl_from_bytes!(TYPE = PodElGamalPubkey, BYTES_LEN = ELGAMAL_PUBKEY_LEN);
 
 #[cfg(not(target_os = "solana"))]
 impl From<ElGamalPubkey> for PodElGamalPubkey {
@@ -141,6 +164,20 @@ impl TryFrom<PodDecryptHandle> for DecryptHandle {
         Self::from_bytes(&pod_handle.0).ok_or(ElGamalError::CiphertextDeserialization)
     }
 }
+
+impl fmt::Display for PodDecryptHandle {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", BASE64_STANDARD.encode(self.0))
+    }
+}
+
+impl_from_str!(
+    TYPE = PodDecryptHandle,
+    BYTES_LEN = DECRYPT_HANDLE_LEN,
+    BASE64_LEN = DECRYPT_HANDLE_MAX_BASE64_LEN
+);
+
+impl_from_bytes!(TYPE = PodDecryptHandle, BYTES_LEN = DECRYPT_HANDLE_LEN);
 
 #[cfg(test)]
 mod tests {

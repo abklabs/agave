@@ -5,8 +5,8 @@ use {
     crate::{accounts_hash::CalculateHashIntermediate, cache_hash_data_stats::CacheHashDataStats},
     bytemuck_derive::{Pod, Zeroable},
     memmap2::MmapMut,
-    solana_measure::measure::Measure,
-    solana_sdk::clock::Slot,
+    solana_clock::Slot,
+    solana_measure::{measure::Measure, measure_us},
     std::{
         collections::HashSet,
         fs::{self, remove_file, File, OpenOptions},
@@ -369,10 +369,17 @@ impl CacheHashData {
         });
         assert_eq!(i, entries);
         m2.stop();
+        // We must flush the mmap after writing, since we're about to turn around and load it for
+        // reading *not* via the mmap.  If the mmap is never flushed to disk, it is possible the
+        // entries will *not* be visible when the reader comes along.
+        let (_, measure_flush_us) = measure_us!(cache_file.mmap.flush()?);
+        m.stop();
         self.stats
             .write_to_mmap_us
             .fetch_add(m2.as_us(), Ordering::Relaxed);
-        m.stop();
+        self.stats
+            .flush_mmap_us
+            .fetch_add(measure_flush_us, Ordering::Relaxed);
         self.stats.save_us.fetch_add(m.as_us(), Ordering::Relaxed);
         self.stats.saved_to_cache.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -562,14 +569,14 @@ mod tests {
                                 let mut pk;
                                 loop {
                                     // expensive, but small numbers and for tests, so ok
-                                    pk = solana_sdk::pubkey::new_rand();
+                                    pk = solana_pubkey::new_rand();
                                     if binner.bin_from_pubkey(&pk) == bin {
                                         break;
                                     }
                                 }
 
                                 CalculateHashIntermediate {
-                                    hash: AccountHash(solana_sdk::hash::Hash::new_unique()),
+                                    hash: AccountHash(solana_hash::Hash::new_unique()),
                                     lamports: ct as u64,
                                     pubkey: pk,
                                 }

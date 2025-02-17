@@ -13,9 +13,9 @@ partitions=$(
 {
   "name": "partitions",
   "command": "ci/docker-run-default-image.sh ci/stable/run-partition.sh",
-  "timeout_in_minutes": 30,
+  "timeout_in_minutes": 25,
   "agent": "$agent",
-  "parallelism": 2,
+  "parallelism": 5,
   "retry": 3
 }
 EOF
@@ -26,9 +26,9 @@ local_cluster_partitions=$(
 {
   "name": "local-cluster",
   "command": "ci/docker-run-default-image.sh ci/stable/run-local-cluster-partially.sh",
-  "timeout_in_minutes": 30,
+  "timeout_in_minutes": 15,
   "agent": "$agent",
-  "parallelism": 5,
+  "parallelism": 10,
   "retry": 3
 }
 EOF

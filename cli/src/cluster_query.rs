@@ -1,7 +1,9 @@
 use {
     crate::{
         cli::{CliCommand, CliCommandInfo, CliConfig, CliError, ProcessResult},
-        compute_budget::{ComputeUnitConfig, WithComputeUnitConfig},
+        compute_budget::{
+            simulate_for_compute_unit_limit, ComputeUnitConfig, WithComputeUnitConfig,
+        },
         feature::get_feature_activation_epoch,
         spend_utils::{resolve_spend_tx_and_check_account_balance, SpendAmount},
     },
@@ -9,6 +11,7 @@ use {
     console::style,
     crossbeam_channel::unbounded,
     serde::{Deserialize, Serialize},
+    solana_account::{from_account, state_traits::StateMut},
     solana_clap_utils::{
         compute_budget::{compute_unit_price_arg, ComputeUnitLimit, COMPUTE_UNIT_PRICE_ARG},
         input_parsers::*,
@@ -24,8 +27,17 @@ use {
         },
         *,
     },
+    solana_clock::{self as clock, Clock, Epoch, Slot},
+    solana_commitment_config::CommitmentConfig,
+    solana_hash::Hash,
+    solana_message::Message,
+    solana_native_token::lamports_to_sol,
+    solana_nonce::state::State as NonceState,
+    solana_program::stake::{self, state::StakeStateV2},
+    solana_pubkey::Pubkey,
     solana_pubsub_client::pubsub_client::PubsubClient,
     solana_remote_wallet::remote_wallet::RemoteWalletManager,
+    solana_rent::Rent,
     solana_rpc_client::rpc_client::{GetConfirmedSignaturesForAddress2Config, RpcClient},
     solana_rpc_client_api::{
         client_error::ErrorKind as ClientErrorKind,
@@ -38,28 +50,12 @@ use {
         request::DELINQUENT_VALIDATOR_SLOT_DISTANCE,
         response::{RpcPerfSample, RpcPrioritizationFee, SlotInfo},
     },
-    solana_sdk::{
-        account::from_account,
-        account_utils::StateMut,
-        clock::{self, Clock, Slot},
-        commitment_config::CommitmentConfig,
-        epoch_schedule::Epoch,
-        feature_set,
-        hash::Hash,
-        message::Message,
-        native_token::lamports_to_sol,
-        nonce::State as NonceState,
-        pubkey::Pubkey,
-        rent::Rent,
-        rpc_port::DEFAULT_RPC_PORT_STR,
-        signature::Signature,
-        slot_history,
-        stake::{self, state::StakeStateV2},
-        system_instruction::{self, MAX_PERMITTED_DATA_LENGTH},
-        sysvar::{self, slot_history::SlotHistory, stake_history},
-        transaction::Transaction,
-    },
+    solana_sdk_ids::sysvar::{self, stake_history},
+    solana_signature::Signature,
+    solana_slot_history::{self as slot_history, SlotHistory},
+    solana_system_interface::{instruction as system_instruction, MAX_PERMITTED_DATA_LENGTH},
     solana_tps_client::TpsClient,
+    solana_transaction::Transaction,
     solana_transaction_status::{
         EncodableWithMeta, EncodedConfirmedTransactionWithStatusMeta, UiTransactionEncoding,
     },
@@ -79,6 +75,8 @@ use {
     },
     thiserror::Error,
 };
+
+const DEFAULT_RPC_PORT_STR: &str = "8899";
 
 pub trait ClusterQuerySubCommands {
     fn cluster_query_subcommands(self) -> Self;
@@ -1435,10 +1433,15 @@ pub fn process_ping(
     rpc_client: &RpcClient,
 ) -> ProcessResult {
     let (signal_sender, signal_receiver) = unbounded();
-    ctrlc::set_handler(move || {
+    let handler = move || {
         let _ = signal_sender.send(());
-    })
-    .expect("Error setting Ctrl-C handler");
+    };
+    match ctrlc::try_set_handler(handler) {
+        // It's possible to set the ctrl-c handler more than once in testing
+        // situations, so let that case through
+        Err(ctrlc::Error::MultipleHandlers) => {}
+        result => result.expect("Error setting Ctrl-C handler"),
+    }
 
     let mut cli_pings = vec![];
 
@@ -1458,6 +1461,23 @@ pub fn process_ping(
         }
     }
 
+    let to = config.signers[0].pubkey();
+    let compute_unit_limit = if compute_unit_price.is_some() {
+        let ixs = vec![system_instruction::transfer(
+            &config.signers[0].pubkey(),
+            &to,
+            lamports,
+        )]
+        .with_compute_unit_config(&ComputeUnitConfig {
+            compute_unit_price,
+            compute_unit_limit: ComputeUnitLimit::Simulated,
+        });
+        let message = Message::new(&ixs, Some(&config.signers[0].pubkey()));
+        ComputeUnitLimit::Static(simulate_for_compute_unit_limit(rpc_client, &message)?)
+    } else {
+        ComputeUnitLimit::Default
+    };
+
     'mainloop: for seq in 0..count.unwrap_or(u64::MAX) {
         let now = Instant::now();
         if fixed_blockhash.is_none() && now.duration_since(blockhash_acquired).as_secs() > 60 {
@@ -1468,7 +1488,6 @@ pub fn process_ping(
             blockhash_acquired = Instant::now();
         }
 
-        let to = config.signers[0].pubkey();
         lamports = lamports.saturating_add(1);
 
         let build_message = |lamports| {
@@ -1479,7 +1498,7 @@ pub fn process_ping(
             )]
             .with_compute_unit_config(&ComputeUnitConfig {
                 compute_unit_price,
-                compute_unit_limit: ComputeUnitLimit::Default,
+                compute_unit_limit,
             });
             Message::new(&ixs, Some(&config.signers[0].pubkey()))
         };
@@ -1489,6 +1508,7 @@ pub fn process_ping(
             SpendAmount::Some(lamports),
             &blockhash,
             &config.signers[0].pubkey(),
+            compute_unit_limit,
             build_message,
             config.commitment,
         )?;
@@ -1875,8 +1895,10 @@ pub fn process_show_stakes(
     let stake_history = from_account(&stake_history_account).ok_or_else(|| {
         CliError::RpcRequestError("Failed to deserialize stake history".to_string())
     })?;
-    let new_rate_activation_epoch =
-        get_feature_activation_epoch(rpc_client, &feature_set::reduce_stake_warmup_cooldown::id())?;
+    let new_rate_activation_epoch = get_feature_activation_epoch(
+        rpc_client,
+        &solana_feature_set::reduce_stake_warmup_cooldown::id(),
+    )?;
     stake_account_progress_bar.finish_and_clear();
 
     let mut stake_accounts: Vec<CliKeyedStakeState> = vec![];
@@ -2293,7 +2315,7 @@ mod tests {
     use {
         super::*,
         crate::{clap_app::get_clap_app, cli::parse_command},
-        solana_sdk::signature::{write_keypair, Keypair},
+        solana_keypair::{write_keypair, Keypair},
         std::str::FromStr,
         tempfile::NamedTempFile,
     };
@@ -2412,5 +2434,13 @@ mod tests {
                 signers: vec![Box::new(default_keypair)],
             }
         );
+    }
+
+    #[test]
+    fn check_default_rpc_port_inline() {
+        assert_eq!(
+            DEFAULT_RPC_PORT_STR,
+            solana_sdk::rpc_port::DEFAULT_RPC_PORT_STR
+        )
     }
 }

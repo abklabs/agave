@@ -28,7 +28,7 @@ use {
     solana_stake_program::stake_state,
     solana_vote_program::{
         vote_instruction,
-        vote_state::{Vote, VoteInit, VoteState, VoteStateVersions},
+        vote_state::{TowerSync, VoteInit, VoteState, VoteStateVersions, MAX_LOCKOUT_HISTORY},
     },
     std::sync::{Arc, RwLock},
 };
@@ -72,6 +72,7 @@ fn fill_epoch_with_votes(
     bank_forks: &RwLock<BankForks>,
     vote_keypair: &Keypair,
     mint_keypair: &Keypair,
+    start_slot: Slot,
 ) -> Arc<Bank> {
     let mint_pubkey = mint_keypair.pubkey();
     let vote_pubkey = vote_keypair.pubkey();
@@ -83,12 +84,18 @@ fn fill_epoch_with_votes(
 
         let bank_client = BankClient::new_shared(bank.clone());
         let parent = bank.parent().unwrap();
-
+        let lowest_slot = u64::max(
+            (parent.slot() + 1).saturating_sub(MAX_LOCKOUT_HISTORY as u64),
+            start_slot,
+        );
+        let slots: Vec<_> = (lowest_slot..(parent.slot() + 1)).collect();
+        let root = (lowest_slot > start_slot).then(|| lowest_slot - 1);
+        let tower_sync = TowerSync::new_from_slots(slots, parent.hash(), root);
         let message = Message::new(
-            &[vote_instruction::vote(
+            &[vote_instruction::tower_sync(
                 &vote_pubkey,
                 &vote_pubkey,
-                Vote::new(vec![parent.slot()], parent.hash()),
+                tower_sync,
             )],
             Some(&mint_pubkey),
         );
@@ -134,11 +141,7 @@ fn test_stake_create_and_split_single_signature() {
         genesis_config,
         mint_keypair: staker_keypair,
         ..
-    } = create_genesis_config_with_leader(
-        100_000_000_000,
-        &solana_sdk::pubkey::new_rand(),
-        1_000_000,
-    );
+    } = create_genesis_config_with_leader(100_000_000_000, &solana_pubkey::new_rand(), 1_000_000);
 
     let staker_pubkey = staker_keypair.pubkey();
 
@@ -210,11 +213,7 @@ fn test_stake_create_and_split_to_existing_system_account() {
         genesis_config,
         mint_keypair: staker_keypair,
         ..
-    } = create_genesis_config_with_leader(
-        100_000_000_000,
-        &solana_sdk::pubkey::new_rand(),
-        1_000_000,
-    );
+    } = create_genesis_config_with_leader(100_000_000_000, &solana_pubkey::new_rand(), 1_000_000);
 
     let staker_pubkey = staker_keypair.pubkey();
 
@@ -300,7 +299,7 @@ fn test_stake_account_lifetime() {
         ..
     } = create_genesis_config_with_leader(
         100_000_000_000,
-        &solana_sdk::pubkey::new_rand(),
+        &solana_pubkey::new_rand(),
         2_000_000_000,
     );
     genesis_config.epoch_schedule = EpochSchedule::new(MINIMUM_SLOTS_PER_EPOCH);
@@ -384,7 +383,7 @@ fn test_stake_account_lifetime() {
         &[stake_instruction::withdraw(
             &stake_pubkey,
             &stake_pubkey,
-            &solana_sdk::pubkey::new_rand(),
+            &solana_pubkey::new_rand(),
             1,
             None,
         )],
@@ -413,7 +412,14 @@ fn test_stake_account_lifetime() {
 
     // Reward redemption
     // Submit enough votes to generate rewards
-    bank = fill_epoch_with_votes(bank, bank_forks.as_ref(), &vote_keypair, &mint_keypair);
+    let start_slot = bank.slot();
+    bank = fill_epoch_with_votes(
+        bank,
+        bank_forks.as_ref(),
+        &vote_keypair,
+        &mint_keypair,
+        start_slot,
+    );
 
     // Test that votes and credits are there
     let account = bank.get_account(&vote_pubkey).expect("account not found");
@@ -426,7 +432,13 @@ fn test_stake_account_lifetime() {
     // one vote per slot, might be more slots than 32 in the epoch
     assert!(vote_state.credits() >= 1);
 
-    bank = fill_epoch_with_votes(bank, bank_forks.as_ref(), &vote_keypair, &mint_keypair);
+    bank = fill_epoch_with_votes(
+        bank,
+        bank_forks.as_ref(),
+        &vote_keypair,
+        &mint_keypair,
+        start_slot,
+    );
 
     let pre_staked = get_staked(&bank, &stake_pubkey);
     let pre_balance = bank.get_balance(&stake_pubkey);
@@ -496,7 +508,7 @@ fn test_stake_account_lifetime() {
         &[stake_instruction::withdraw(
             &split_stake_pubkey,
             &stake_pubkey,
-            &solana_sdk::pubkey::new_rand(),
+            &solana_pubkey::new_rand(),
             split_starting_delegation + 1,
             None,
         )],
@@ -520,7 +532,7 @@ fn test_stake_account_lifetime() {
         &[stake_instruction::withdraw(
             &split_stake_pubkey,
             &stake_pubkey,
-            &solana_sdk::pubkey::new_rand(),
+            &solana_pubkey::new_rand(),
             split_balance,
             None,
         )],
@@ -537,7 +549,7 @@ fn test_stake_account_lifetime() {
         &[stake_instruction::withdraw(
             &split_stake_pubkey,
             &stake_pubkey,
-            &solana_sdk::pubkey::new_rand(),
+            &solana_pubkey::new_rand(),
             split_unstaked,
             None,
         )],
@@ -562,7 +574,7 @@ fn test_stake_account_lifetime() {
         &[stake_instruction::withdraw(
             &split_stake_pubkey,
             &stake_pubkey,
-            &solana_sdk::pubkey::new_rand(),
+            &solana_pubkey::new_rand(),
             split_remaining_balance,
             None,
         )],
@@ -588,11 +600,7 @@ fn test_create_stake_account_from_seed() {
         genesis_config,
         mint_keypair,
         ..
-    } = create_genesis_config_with_leader(
-        100_000_000_000,
-        &solana_sdk::pubkey::new_rand(),
-        1_000_000,
-    );
+    } = create_genesis_config_with_leader(100_000_000_000, &solana_pubkey::new_rand(), 1_000_000);
     let (bank, _bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
     let mint_pubkey = mint_keypair.pubkey();
     let bank_client = BankClient::new_shared(bank.clone());

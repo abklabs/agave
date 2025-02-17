@@ -1,11 +1,9 @@
 //! The `retransmit_stage` retransmits shreds between validators
-#![allow(clippy::rc_buffer)]
 
 use {
     crate::cluster_nodes::{self, ClusterNodes, ClusterNodesCache, Error, MAX_NUM_TURBINE_HOPS},
     bytes::Bytes,
-    crossbeam_channel::{Receiver, RecvTimeoutError},
-    itertools::{izip, Itertools},
+    crossbeam_channel::{Receiver, RecvError},
     lru::LruCache,
     rand::Rng,
     rayon::{prelude::*, ThreadPool, ThreadPoolBuilder},
@@ -17,7 +15,10 @@ use {
     solana_measure::measure::Measure,
     solana_perf::deduper::Deduper,
     solana_rayon_threadlimit::get_thread_count,
-    solana_rpc::{max_slots::MaxSlots, rpc_subscriptions::RpcSubscriptions},
+    solana_rpc::{
+        max_slots::MaxSlots, rpc_subscriptions::RpcSubscriptions,
+        slot_status_notifier::SlotStatusNotifier,
+    },
     solana_rpc_client_api::response::SlotUpdate,
     solana_runtime::{
         bank::{Bank, MAX_LEADER_SCHEDULE_STAKES},
@@ -30,8 +31,7 @@ use {
     },
     static_assertions::const_assert_eq,
     std::{
-        collections::HashMap,
-        iter::repeat,
+        collections::{HashMap, HashSet},
         net::{SocketAddr, UdpSocket},
         ops::AddAssign,
         sync::{
@@ -71,7 +71,7 @@ struct RetransmitStats {
     num_addrs_failed: AtomicUsize,
     num_loopback_errs: AtomicUsize,
     num_shreds: usize,
-    num_shreds_skipped: usize,
+    num_shreds_skipped: AtomicUsize,
     num_small_batches: usize,
     total_batches: usize,
     total_time: u64,
@@ -109,7 +109,11 @@ impl RetransmitStats {
             ("num_addrs_failed", *self.num_addrs_failed.get_mut(), i64),
             ("num_loopback_errs", *self.num_loopback_errs.get_mut(), i64),
             ("num_shreds", self.num_shreds, i64),
-            ("num_shreds_skipped", self.num_shreds_skipped, i64),
+            (
+                "num_shreds_skipped",
+                *self.num_shreds_skipped.get_mut(),
+                i64
+            ),
             ("retransmit_total", *self.retransmit_total.get_mut(), i64),
             (
                 "compute_turbine",
@@ -126,18 +130,9 @@ impl RetransmitStats {
         let old = std::mem::replace(self, Self::new(Instant::now()));
         self.slot_stats = old.slot_stats;
     }
-
-    fn record_error(&self, err: &Error) {
-        match err {
-            Error::Loopback { .. } => {
-                error!("retransmit_shred: {err}");
-                self.num_loopback_errs.fetch_add(1, Ordering::Relaxed)
-            }
-        };
-    }
 }
 
-struct ShredDeduper<const K: usize> {
+struct ShredDeduper<const K: usize = 2> {
     deduper: Deduper<K, /*shred:*/ [u8]>,
     shred_id_filter: Deduper<K, (ShredId, /*0..MAX_DUPLICATE_COUNT:*/ usize)>,
 }
@@ -162,33 +157,50 @@ impl<const K: usize> ShredDeduper<K> {
             .maybe_reset(rng, false_positive_rate, reset_cycle);
     }
 
+    // Returns true if the shred is duplicate and should be discarded.
+    #[must_use]
     fn dedup(&self, key: ShredId, shred: &[u8], max_duplicate_count: usize) -> bool {
+        // Shreds in the retransmit stage:
+        //   * don't have repair nonce (repaired shreds are not retransmitted).
+        //   * are already resigned by this node as the retransmitter.
+        //   * have their leader's signature verified.
+        // Therefore in order to dedup shreds, it suffices to compare:
+        //    (signature, slot, shred-index, shred-type)
+        // Because ShredCommonHeader already includes all of the above tuple,
+        // the rest of the payload can be skipped.
         // In order to detect duplicate blocks across cluster, we retransmit
         // max_duplicate_count different shreds for each ShredId.
-        self.deduper.dedup(shred)
+        shred::layout::get_common_header_bytes(shred)
+            .map(|header| self.deduper.dedup(header))
+            .unwrap_or(true)
             || (0..max_duplicate_count).all(|i| self.shred_id_filter.dedup(&(key, i)))
     }
 }
 
+// pull the shreds from the shreds_receiver until empty, then retransmit them.
+// uses a thread_pool to parallelize work if there are enough shreds to justify that
 #[allow(clippy::too_many_arguments)]
 fn retransmit(
     thread_pool: &ThreadPool,
     bank_forks: &RwLock<BankForks>,
     leader_schedule_cache: &LeaderScheduleCache,
     cluster_info: &ClusterInfo,
-    shreds_receiver: &Receiver<Vec</*shred:*/ Vec<u8>>>,
-    sockets: &[UdpSocket],
+    retransmit_receiver: &Receiver<Vec<shred::Payload>>,
+    retransmit_sockets: &[UdpSocket],
     quic_endpoint_sender: &AsyncSender<(SocketAddr, Bytes)>,
     stats: &mut RetransmitStats,
     cluster_nodes_cache: &ClusterNodesCache<RetransmitStage>,
-    shred_deduper: &mut ShredDeduper<2>,
+    shred_deduper: &mut ShredDeduper,
     max_slots: &MaxSlots,
     rpc_subscriptions: Option<&RpcSubscriptions>,
-) -> Result<(), RecvTimeoutError> {
-    const RECV_TIMEOUT: Duration = Duration::from_secs(1);
-    let mut shreds = shreds_receiver.recv_timeout(RECV_TIMEOUT)?;
+    slot_status_notifier: Option<&SlotStatusNotifier>,
+) -> Result<(), RecvError> {
+    // wait for something on the channel
+    let mut shreds = retransmit_receiver.recv()?;
+    // now the batch has started
     let mut timer_start = Measure::start("retransmit");
-    shreds.extend(shreds_receiver.try_iter().flatten());
+    // drain the channel until it is empty to form a batch
+    shreds.extend(retransmit_receiver.try_iter().flatten());
     stats.num_shreds += shreds.len();
     stats.total_batches += 1;
 
@@ -209,20 +221,12 @@ fn retransmit(
     epoch_cache_update.stop();
     stats.epoch_cache_update += epoch_cache_update.as_us();
     // Lookup slot leader and cluster nodes for each slot.
-    let shreds: Vec<_> = shreds
+    let cache: HashMap<Slot, _> = shreds
+        .iter()
+        .filter_map(|shred| shred::layout::get_slot(shred))
+        .collect::<HashSet<Slot>>()
         .into_iter()
-        .filter_map(|shred| {
-            let key = shred::layout::get_shred_id(&shred)?;
-            if shred_deduper.dedup(key, &shred, MAX_DUPLICATE_COUNT) {
-                stats.num_shreds_skipped += 1;
-                None
-            } else {
-                Some((key, shred))
-            }
-        })
-        .into_group_map_by(|(key, _shred)| key.slot())
-        .into_iter()
-        .filter_map(|(slot, shreds)| {
+        .filter_map(|slot: Slot| {
             max_slots.retransmit.fetch_max(slot, Ordering::Relaxed);
             // TODO: consider using root-bank here for leader lookup!
             // Shreds' signatures should be verified before they reach here,
@@ -236,9 +240,8 @@ fn retransmit(
             };
             let cluster_nodes =
                 cluster_nodes_cache.get(slot, &root_bank, &working_bank, cluster_info);
-            Some(izip!(shreds, repeat(slot_leader), repeat(cluster_nodes)))
+            Some((slot, (slot_leader, cluster_nodes)))
         })
-        .flatten()
         .collect();
     let socket_addr_space = cluster_info.socket_addr_space();
     let record = |mut stats: HashMap<Slot, RetransmitSlotStats>,
@@ -253,80 +256,84 @@ fn retransmit(
         shreds
             .into_iter()
             .enumerate()
-            .filter_map(|(index, ((key, shred), slot_leader, cluster_nodes))| {
-                let (root_distance, num_nodes) = retransmit_shred(
-                    &key,
-                    &shred,
-                    &slot_leader,
+            .filter_map(|(index, shred)| {
+                retransmit_shred(
+                    shred,
                     &root_bank,
-                    &cluster_nodes,
+                    shred_deduper,
+                    &cache,
                     socket_addr_space,
-                    &sockets[index % sockets.len()],
+                    &retransmit_sockets[index % retransmit_sockets.len()],
                     quic_endpoint_sender,
                     stats,
                 )
-                .map_err(|err| {
-                    stats.record_error(&err);
-                    err
-                })
-                .ok()?;
-                Some((key.slot(), root_distance, num_nodes))
             })
             .fold(HashMap::new(), record)
     } else {
         thread_pool.install(|| {
             shreds
                 .into_par_iter()
-                .filter_map(|((key, shred), slot_leader, cluster_nodes)| {
+                .filter_map(|shred| {
                     let index = thread_pool.current_thread_index().unwrap();
-                    let (root_distance, num_nodes) = retransmit_shred(
-                        &key,
-                        &shred,
-                        &slot_leader,
+                    retransmit_shred(
+                        shred,
                         &root_bank,
-                        &cluster_nodes,
+                        shred_deduper,
+                        &cache,
                         socket_addr_space,
-                        &sockets[index % sockets.len()],
+                        &retransmit_sockets[index % retransmit_sockets.len()],
                         quic_endpoint_sender,
                         stats,
                     )
-                    .map_err(|err| {
-                        stats.record_error(&err);
-                        err
-                    })
-                    .ok()?;
-                    Some((key.slot(), root_distance, num_nodes))
                 })
                 .fold(HashMap::new, record)
                 .reduce(HashMap::new, RetransmitSlotStats::merge)
         })
     };
-    stats.upsert_slot_stats(slot_stats, root_bank.slot(), rpc_subscriptions);
+    stats.upsert_slot_stats(
+        slot_stats,
+        root_bank.slot(),
+        rpc_subscriptions,
+        slot_status_notifier,
+    );
     timer_start.stop();
     stats.total_time += timer_start.as_us();
     stats.maybe_submit(&root_bank, &working_bank, cluster_info, cluster_nodes_cache);
     Ok(())
 }
 
+// Retransmit a single shred to all downstream nodes
 fn retransmit_shred(
-    key: &ShredId,
-    shred: &[u8],
-    slot_leader: &Pubkey,
+    shred: shred::Payload,
     root_bank: &Bank,
-    cluster_nodes: &ClusterNodes<RetransmitStage>,
+    shred_deduper: &ShredDeduper,
+    cache: &HashMap<Slot, (/*leader:*/ Pubkey, Arc<ClusterNodes<RetransmitStage>>)>,
     socket_addr_space: &SocketAddrSpace,
     socket: &UdpSocket,
     quic_endpoint_sender: &AsyncSender<(SocketAddr, Bytes)>,
     stats: &RetransmitStats,
-) -> Result<(/*root_distance:*/ usize, /*num_nodes:*/ usize), Error> {
+) -> Option<(
+    Slot,  // Shred slot.
+    usize, // This node's distance from the turbine root.
+    usize, // Number of nodes the shred was retransmitted to.
+)> {
+    let key = shred::layout::get_shred_id(shred.as_ref())?;
+    let (slot_leader, cluster_nodes) = cache.get(&key.slot())?;
+    if shred_deduper.dedup(key, shred.as_ref(), MAX_DUPLICATE_COUNT) {
+        stats.num_shreds_skipped.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
     let mut compute_turbine_peers = Measure::start("turbine_start");
     let data_plane_fanout = cluster_nodes::get_data_plane_fanout(key.slot(), root_bank);
-    let (root_distance, addrs) =
-        cluster_nodes.get_retransmit_addrs(slot_leader, key, data_plane_fanout)?;
-    let addrs: Vec<_> = addrs
-        .into_iter()
-        .filter(|addr| socket_addr_space.check(addr))
-        .collect();
+    let (root_distance, addrs) = cluster_nodes
+        .get_retransmit_addrs(slot_leader, &key, data_plane_fanout, socket_addr_space)
+        .inspect_err(|err| match err {
+            Error::Loopback { .. } => {
+                error!("retransmit_shred: {err}");
+                stats.num_loopback_errs.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+        .ok()?;
     compute_turbine_peers.stop();
     stats
         .compute_turbine_peers_total
@@ -334,9 +341,9 @@ fn retransmit_shred(
 
     let mut retransmit_time = Measure::start("retransmit_to");
     let num_addrs = addrs.len();
-    let num_nodes = match cluster_nodes::get_broadcast_protocol(key) {
+    let num_nodes = match cluster_nodes::get_broadcast_protocol(&key) {
         Protocol::QUIC => {
-            let shred = Bytes::copy_from_slice(shred);
+            let shred = Bytes::from(shred::Payload::unwrap_or_clone(shred));
             addrs
                 .into_iter()
                 .filter_map(|addr| quic_endpoint_sender.try_send((addr, shred.clone())).ok())
@@ -346,9 +353,7 @@ fn retransmit_shred(
             Ok(()) => addrs.len(),
             Err(SendPktsError::IoError(ioerr, num_failed)) => {
                 error!(
-                    "retransmit_to multi_target_send error: {:?}, {}/{} packets failed",
-                    ioerr,
-                    num_failed,
+                    "retransmit_to multi_target_send error: {ioerr:?}, {num_failed}/{} packets failed",
                     addrs.len(),
                 );
                 addrs.len() - num_failed
@@ -363,91 +368,78 @@ fn retransmit_shred(
     stats
         .retransmit_total
         .fetch_add(retransmit_time.as_us(), Ordering::Relaxed);
-    Ok((root_distance, num_nodes))
+    Some((key.slot(), root_distance, num_nodes))
 }
 
-/// Service to retransmit messages from the leader or layer 1 to relevant peer nodes.
-/// See `cluster_info` for network layer definitions.
-/// # Arguments
-/// * `sockets` - Sockets to read from.
-/// * `bank_forks` - The BankForks structure
-/// * `leader_schedule_cache` - The leader schedule to verify shreds
-/// * `cluster_info` - This structure needs to be updated and populated by the bank and via gossip.
-/// * `r` - Receive channel for shreds to be retransmitted to all the layer 1 nodes.
-pub fn retransmitter(
-    sockets: Arc<Vec<UdpSocket>>,
-    quic_endpoint_sender: AsyncSender<(SocketAddr, Bytes)>,
-    bank_forks: Arc<RwLock<BankForks>>,
-    leader_schedule_cache: Arc<LeaderScheduleCache>,
-    cluster_info: Arc<ClusterInfo>,
-    shreds_receiver: Receiver<Vec</*shred:*/ Vec<u8>>>,
-    max_slots: Arc<MaxSlots>,
-    rpc_subscriptions: Option<Arc<RpcSubscriptions>>,
-) -> JoinHandle<()> {
-    let cluster_nodes_cache = ClusterNodesCache::<RetransmitStage>::new(
-        CLUSTER_NODES_CACHE_NUM_EPOCH_CAP,
-        CLUSTER_NODES_CACHE_TTL,
-    );
-    let mut rng = rand::thread_rng();
-    let mut shred_deduper = ShredDeduper::<2>::new(&mut rng, DEDUPER_NUM_BITS);
-    let mut stats = RetransmitStats::new(Instant::now());
-    #[allow(clippy::manual_clamp)]
-    let num_threads = get_thread_count().min(8).max(sockets.len());
-    let thread_pool = ThreadPoolBuilder::new()
-        .num_threads(num_threads)
-        .thread_name(|i| format!("solRetransmit{i:02}"))
-        .build()
-        .unwrap();
-    Builder::new()
-        .name("solRetransmittr".to_string())
-        .spawn(move || loop {
-            match retransmit(
-                &thread_pool,
-                &bank_forks,
-                &leader_schedule_cache,
-                &cluster_info,
-                &shreds_receiver,
-                &sockets,
-                &quic_endpoint_sender,
-                &mut stats,
-                &cluster_nodes_cache,
-                &mut shred_deduper,
-                &max_slots,
-                rpc_subscriptions.as_deref(),
-            ) {
-                Ok(()) => (),
-                Err(RecvTimeoutError::Timeout) => (),
-                Err(RecvTimeoutError::Disconnected) => break,
-            }
-        })
-        .unwrap()
-}
-
+/// Service to retransmit messages received from other peers in turbine.
 pub struct RetransmitStage {
     retransmit_thread_handle: JoinHandle<()>,
 }
 
 impl RetransmitStage {
+    /// Construct the RetransmitStage.
+    ///
+    /// Key arguments:
+    /// * `retransmit_sockets` - Sockets to use for transmission of shreds
+    /// * `max_slots` - Structure to keep track of the Turbine progress
+    /// * `bank_forks` - Reference to the BankForks structure
+    /// * `leader_schedule_cache` - The leader schedule to verify shreds
+    /// * `cluster_info` - This structure needs to be updated and populated by the bank and via gossip.
+    /// * `retransmit_receiver` - Receive channel for batches of shreds to be retransmitted.
     pub fn new(
         bank_forks: Arc<RwLock<BankForks>>,
         leader_schedule_cache: Arc<LeaderScheduleCache>,
         cluster_info: Arc<ClusterInfo>,
         retransmit_sockets: Arc<Vec<UdpSocket>>,
         quic_endpoint_sender: AsyncSender<(SocketAddr, Bytes)>,
-        retransmit_receiver: Receiver<Vec</*shred:*/ Vec<u8>>>,
+        retransmit_receiver: Receiver<Vec<shred::Payload>>,
         max_slots: Arc<MaxSlots>,
         rpc_subscriptions: Option<Arc<RpcSubscriptions>>,
+        slot_status_notifier: Option<SlotStatusNotifier>,
     ) -> Self {
-        let retransmit_thread_handle = retransmitter(
-            retransmit_sockets,
-            quic_endpoint_sender,
-            bank_forks,
-            leader_schedule_cache,
-            cluster_info,
-            retransmit_receiver,
-            max_slots,
-            rpc_subscriptions,
+        let cluster_nodes_cache = ClusterNodesCache::<RetransmitStage>::new(
+            CLUSTER_NODES_CACHE_NUM_EPOCH_CAP,
+            CLUSTER_NODES_CACHE_TTL,
         );
+
+        let mut stats = RetransmitStats::new(Instant::now());
+
+        let mut rng = rand::thread_rng();
+        let mut shred_deduper = ShredDeduper::new(&mut rng, DEDUPER_NUM_BITS);
+
+        let thread_pool = {
+            // Using clamp will panic if less than 8 sockets are provided
+            #[allow(clippy::manual_clamp)]
+            let num_threads = get_thread_count().min(8).max(retransmit_sockets.len());
+            ThreadPoolBuilder::new()
+                .num_threads(num_threads)
+                .thread_name(|i| format!("solRetransmit{i:02}"))
+                .build()
+                .unwrap()
+        };
+
+        let retransmit_thread_handle = Builder::new()
+            .name("solRetransmittr".to_string())
+            .spawn(move || {
+                while retransmit(
+                    &thread_pool,
+                    &bank_forks,
+                    &leader_schedule_cache,
+                    &cluster_info,
+                    &retransmit_receiver,
+                    &retransmit_sockets,
+                    &quic_endpoint_sender,
+                    &mut stats,
+                    &cluster_nodes_cache,
+                    &mut shred_deduper,
+                    &max_slots,
+                    rpc_subscriptions.as_deref(),
+                    slot_status_notifier.as_ref(),
+                )
+                .is_ok()
+                {}
+            })
+            .unwrap();
 
         Self {
             retransmit_thread_handle,
@@ -490,7 +482,7 @@ impl RetransmitStats {
             num_addrs_failed: AtomicUsize::default(),
             num_loopback_errs: AtomicUsize::default(),
             num_shreds: 0usize,
-            num_shreds_skipped: 0usize,
+            num_shreds_skipped: AtomicUsize::default(),
             total_batches: 0usize,
             num_small_batches: 0usize,
             total_time: 0u64,
@@ -498,7 +490,7 @@ impl RetransmitStats {
             epoch_cache_update: 0u64,
             retransmit_total: AtomicU64::default(),
             compute_turbine_peers_total: AtomicU64::default(),
-            // Cache capacity is manually enforced.
+            // Cache capacity is manually enforced by `SLOT_STATS_CACHE_CAPACITY`
             slot_stats: LruCache::<Slot, RetransmitSlotStats>::unbounded(),
             unknown_shred_slot_leader: 0usize,
         }
@@ -509,6 +501,7 @@ impl RetransmitStats {
         feed: I,
         root: Slot,
         rpc_subscriptions: Option<&RpcSubscriptions>,
+        slot_status_notifier: Option<&SlotStatusNotifier>,
     ) where
         I: IntoIterator<Item = (Slot, RetransmitSlotStats)>,
     {
@@ -525,6 +518,16 @@ impl RetransmitStats {
                             datapoint_info!("retransmit-first-shred", ("slot", slot, i64));
                         }
                     }
+
+                    if let Some(slot_status_notifier) = slot_status_notifier {
+                        if slot > root {
+                            slot_status_notifier
+                                .read()
+                                .unwrap()
+                                .notify_first_shred_received(slot);
+                        }
+                    }
+
                     self.slot_stats.put(slot, slot_stats);
                 }
                 Some(entry) => {
@@ -608,14 +611,27 @@ mod tests {
         rand::SeedableRng,
         rand_chacha::ChaChaRng,
         solana_ledger::shred::{Shred, ShredFlags},
+        solana_sdk::signature::Keypair,
     };
+
+    fn get_keypair() -> Keypair {
+        const KEYPAIR: &str = "Fcc2HUvRC7Dv4GgehTziAremzRvwDw5miYu8Ahuu1rsGjA\
+            5eCn55pXiSkEPcuqviV41rJxrFpZDmHmQkZWfoYYS";
+        bs58::decode(KEYPAIR)
+            .into_vec()
+            .as_deref()
+            .map(Keypair::from_bytes)
+            .unwrap()
+            .unwrap()
+    }
 
     #[test]
     fn test_already_received() {
         let slot = 1;
         let index = 5;
         let version = 0x40;
-        let shred = Shred::new_from_data(
+        let keypair = get_keypair();
+        let mut shred = Shred::new_from_data(
             slot,
             index,
             0,
@@ -625,14 +641,14 @@ mod tests {
             version,
             0,
         );
+        shred.sign(&keypair);
         let mut rng = ChaChaRng::from_seed([0xa5; 32]);
         let shred_deduper = ShredDeduper::<2>::new(&mut rng, /*num_bits:*/ 640_007);
         // unique shred for (1, 5) should pass
         assert!(!shred_deduper.dedup(shred.id(), shred.payload(), MAX_DUPLICATE_COUNT));
         // duplicate shred for (1, 5) blocked
         assert!(shred_deduper.dedup(shred.id(), shred.payload(), MAX_DUPLICATE_COUNT));
-
-        let shred = Shred::new_from_data(
+        let mut shred = Shred::new_from_data(
             slot,
             index,
             2,
@@ -642,12 +658,13 @@ mod tests {
             version,
             0,
         );
+        shred.sign(&keypair);
         // first duplicate shred for (1, 5) passed
         assert!(!shred_deduper.dedup(shred.id(), shred.payload(), MAX_DUPLICATE_COUNT));
         // then blocked
         assert!(shred_deduper.dedup(shred.id(), shred.payload(), MAX_DUPLICATE_COUNT));
 
-        let shred = Shred::new_from_data(
+        let mut shred = Shred::new_from_data(
             slot,
             index,
             8,
@@ -657,6 +674,7 @@ mod tests {
             version,
             0,
         );
+        shred.sign(&keypair);
         // 2nd duplicate shred for (1, 5) blocked
         assert!(shred_deduper.dedup(shred.id(), shred.payload(), MAX_DUPLICATE_COUNT));
         assert!(shred_deduper.dedup(shred.id(), shred.payload(), MAX_DUPLICATE_COUNT));

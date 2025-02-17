@@ -6,13 +6,13 @@
 use {
     crate::{block_cost_limits::*, transaction_cost::TransactionCost},
     solana_metrics::datapoint_info,
-    solana_sdk::{
-        clock::Slot, pubkey::Pubkey, saturating_add_assign, transaction::TransactionError,
-    },
-    std::{cmp::Ordering, collections::HashMap},
+    solana_pubkey::Pubkey,
+    solana_runtime_transaction::transaction_with_meta::TransactionWithMeta,
+    solana_transaction_error::TransactionError,
+    std::{cmp::Ordering, collections::HashMap, num::Saturating},
 };
 
-const WRITABLE_ACCOUNTS_PER_BLOCK: usize = 512;
+const WRITABLE_ACCOUNTS_PER_BLOCK: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CostTrackerError {
@@ -66,15 +66,16 @@ pub struct CostTracker {
     cost_by_writable_accounts: HashMap<Pubkey, u64, ahash::RandomState>,
     block_cost: u64,
     vote_cost: u64,
-    transaction_count: u64,
-    allocated_accounts_data_size: u64,
-    transaction_signature_count: u64,
-    secp256k1_instruction_signature_count: u64,
-    ed25519_instruction_signature_count: u64,
+    transaction_count: Saturating<u64>,
+    allocated_accounts_data_size: Saturating<u64>,
+    transaction_signature_count: Saturating<u64>,
+    secp256k1_instruction_signature_count: Saturating<u64>,
+    ed25519_instruction_signature_count: Saturating<u64>,
     /// The number of transactions that have had their estimated cost added to
     /// the tracker, but are still waiting for an update with actual usage or
     /// removal if the transaction does not end up getting committed.
-    in_flight_transaction_count: usize,
+    in_flight_transaction_count: Saturating<usize>,
+    secp256r1_instruction_signature_count: Saturating<u64>,
 }
 
 impl Default for CostTracker {
@@ -95,27 +96,44 @@ impl Default for CostTracker {
             ),
             block_cost: 0,
             vote_cost: 0,
-            transaction_count: 0,
-            allocated_accounts_data_size: 0,
-            transaction_signature_count: 0,
-            secp256k1_instruction_signature_count: 0,
-            ed25519_instruction_signature_count: 0,
-            in_flight_transaction_count: 0,
+            transaction_count: Saturating(0),
+            allocated_accounts_data_size: Saturating(0),
+            transaction_signature_count: Saturating(0),
+            secp256k1_instruction_signature_count: Saturating(0),
+            ed25519_instruction_signature_count: Saturating(0),
+            in_flight_transaction_count: Saturating(0),
+            secp256r1_instruction_signature_count: Saturating(0),
         }
     }
 }
 
 impl CostTracker {
+    pub fn new_from_parent_limits(&self) -> Self {
+        let mut new = Self::default();
+        new.set_limits(
+            self.account_cost_limit,
+            self.block_cost_limit,
+            self.vote_cost_limit,
+        );
+        new
+    }
+
     pub fn reset(&mut self) {
         self.cost_by_writable_accounts.clear();
         self.block_cost = 0;
         self.vote_cost = 0;
-        self.transaction_count = 0;
-        self.allocated_accounts_data_size = 0;
-        self.transaction_signature_count = 0;
-        self.secp256k1_instruction_signature_count = 0;
-        self.ed25519_instruction_signature_count = 0;
-        self.in_flight_transaction_count = 0;
+        self.transaction_count = Saturating(0);
+        self.allocated_accounts_data_size = Saturating(0);
+        self.transaction_signature_count = Saturating(0);
+        self.secp256k1_instruction_signature_count = Saturating(0);
+        self.ed25519_instruction_signature_count = Saturating(0);
+        self.secp256r1_instruction_signature_count = Saturating(0);
+        self.in_flight_transaction_count = Saturating(0);
+    }
+
+    /// Get the overall block limit.
+    pub fn get_block_limit(&self) -> u64 {
+        self.block_cost_limit
     }
 
     /// allows to adjust limits initiated during construction
@@ -131,23 +149,21 @@ impl CostTracker {
     }
 
     pub fn in_flight_transaction_count(&self) -> usize {
-        self.in_flight_transaction_count
+        self.in_flight_transaction_count.0
     }
 
     pub fn add_transactions_in_flight(&mut self, in_flight_transaction_count: usize) {
-        saturating_add_assign!(
-            self.in_flight_transaction_count,
-            in_flight_transaction_count
-        );
+        self.in_flight_transaction_count += in_flight_transaction_count;
     }
 
     pub fn sub_transactions_in_flight(&mut self, in_flight_transaction_count: usize) {
-        self.in_flight_transaction_count = self
-            .in_flight_transaction_count
-            .saturating_sub(in_flight_transaction_count);
+        self.in_flight_transaction_count -= in_flight_transaction_count
     }
 
-    pub fn try_add(&mut self, tx_cost: &TransactionCost) -> Result<UpdatedCosts, CostTrackerError> {
+    pub fn try_add(
+        &mut self,
+        tx_cost: &TransactionCost<impl TransactionWithMeta>,
+    ) -> Result<UpdatedCosts, CostTrackerError> {
         self.would_fit(tx_cost)?;
         let updated_costliest_account_cost = self.add_transaction_cost(tx_cost);
         Ok(UpdatedCosts {
@@ -158,7 +174,7 @@ impl CostTracker {
 
     pub fn update_execution_cost(
         &mut self,
-        estimated_tx_cost: &TransactionCost,
+        estimated_tx_cost: &TransactionCost<impl TransactionWithMeta>,
         actual_execution_units: u64,
         actual_loaded_accounts_data_size_cost: u64,
     ) {
@@ -184,7 +200,7 @@ impl CostTracker {
         }
     }
 
-    pub fn remove(&mut self, tx_cost: &TransactionCost) {
+    pub fn remove(&mut self, tx_cost: &TransactionCost<impl TransactionWithMeta>) {
         self.remove_transaction_cost(tx_cost);
     }
 
@@ -192,13 +208,17 @@ impl CostTracker {
         self.block_cost
     }
 
-    pub fn transaction_count(&self) -> u64 {
-        self.transaction_count
+    pub fn vote_cost(&self) -> u64 {
+        self.vote_cost
     }
 
-    pub fn report_stats(&self, bank_slot: Slot) {
+    pub fn transaction_count(&self) -> u64 {
+        self.transaction_count.0
+    }
+
+    pub fn report_stats(&self, bank_slot: solana_clock::Slot) {
         // skip reporting if block is empty
-        if self.transaction_count == 0 {
+        if self.transaction_count.0 == 0 {
             return;
         }
 
@@ -209,35 +229,40 @@ impl CostTracker {
             ("bank_slot", bank_slot as i64, i64),
             ("block_cost", self.block_cost as i64, i64),
             ("vote_cost", self.vote_cost as i64, i64),
-            ("transaction_count", self.transaction_count as i64, i64),
+            ("transaction_count", self.transaction_count.0 as i64, i64),
             ("number_of_accounts", self.number_of_accounts() as i64, i64),
             ("costliest_account", costliest_account.to_string(), String),
             ("costliest_account_cost", costliest_account_cost as i64, i64),
             (
                 "allocated_accounts_data_size",
-                self.allocated_accounts_data_size,
+                self.allocated_accounts_data_size.0,
                 i64
             ),
             (
                 "transaction_signature_count",
-                self.transaction_signature_count,
+                self.transaction_signature_count.0,
                 i64
             ),
             (
                 "secp256k1_instruction_signature_count",
-                self.secp256k1_instruction_signature_count,
+                self.secp256k1_instruction_signature_count.0,
                 i64
             ),
             (
                 "ed25519_instruction_signature_count",
-                self.ed25519_instruction_signature_count,
+                self.ed25519_instruction_signature_count.0,
                 i64
             ),
             (
                 "inflight_transaction_count",
-                self.in_flight_transaction_count,
+                self.in_flight_transaction_count.0,
                 i64
             ),
+            (
+                "secp256r1_instruction_signature_count",
+                self.secp256r1_instruction_signature_count.0,
+                i64
+            )
         );
     }
 
@@ -249,7 +274,10 @@ impl CostTracker {
             .unwrap_or_default()
     }
 
-    fn would_fit(&self, tx_cost: &TransactionCost) -> Result<(), CostTrackerError> {
+    fn would_fit(
+        &self,
+        tx_cost: &TransactionCost<impl TransactionWithMeta>,
+    ) -> Result<(), CostTrackerError> {
         let cost: u64 = tx_cost.sum();
 
         if tx_cost.is_simple_vote() {
@@ -269,16 +297,15 @@ impl CostTracker {
             return Err(CostTrackerError::WouldExceedAccountMaxLimit);
         }
 
-        let allocated_accounts_data_size = self
-            .allocated_accounts_data_size
-            .saturating_add(tx_cost.allocated_accounts_data_size());
+        let allocated_accounts_data_size =
+            self.allocated_accounts_data_size + Saturating(tx_cost.allocated_accounts_data_size());
 
-        if allocated_accounts_data_size > MAX_BLOCK_ACCOUNTS_DATA_SIZE_DELTA {
+        if allocated_accounts_data_size.0 > MAX_BLOCK_ACCOUNTS_DATA_SIZE_DELTA {
             return Err(CostTrackerError::WouldExceedAccountDataBlockLimit);
         }
 
         // check each account against account_cost_limit,
-        for account_key in tx_cost.writable_accounts().iter() {
+        for account_key in tx_cost.writable_accounts() {
             match self.cost_by_writable_accounts.get(account_key) {
                 Some(chained_cost) => {
                     if chained_cost.saturating_add(cost) > self.account_cost_limit {
@@ -295,54 +322,40 @@ impl CostTracker {
     }
 
     // Returns the highest account cost for all write-lock accounts `TransactionCost` updated
-    fn add_transaction_cost(&mut self, tx_cost: &TransactionCost) -> u64 {
-        saturating_add_assign!(
-            self.allocated_accounts_data_size,
-            tx_cost.allocated_accounts_data_size()
-        );
-        saturating_add_assign!(self.transaction_count, 1);
-        saturating_add_assign!(
-            self.transaction_signature_count,
-            tx_cost.num_transaction_signatures()
-        );
-        saturating_add_assign!(
-            self.secp256k1_instruction_signature_count,
-            tx_cost.num_secp256k1_instruction_signatures()
-        );
-        saturating_add_assign!(
-            self.ed25519_instruction_signature_count,
-            tx_cost.num_ed25519_instruction_signatures()
-        );
+    fn add_transaction_cost(&mut self, tx_cost: &TransactionCost<impl TransactionWithMeta>) -> u64 {
+        self.allocated_accounts_data_size += tx_cost.allocated_accounts_data_size();
+        self.transaction_count += 1;
+        self.transaction_signature_count += tx_cost.num_transaction_signatures();
+        self.secp256k1_instruction_signature_count +=
+            tx_cost.num_secp256k1_instruction_signatures();
+        self.ed25519_instruction_signature_count += tx_cost.num_ed25519_instruction_signatures();
+        self.secp256r1_instruction_signature_count +=
+            tx_cost.num_secp256r1_instruction_signatures();
         self.add_transaction_execution_cost(tx_cost, tx_cost.sum())
     }
 
-    fn remove_transaction_cost(&mut self, tx_cost: &TransactionCost) {
+    fn remove_transaction_cost(&mut self, tx_cost: &TransactionCost<impl TransactionWithMeta>) {
         let cost = tx_cost.sum();
         self.sub_transaction_execution_cost(tx_cost, cost);
-        self.allocated_accounts_data_size = self
-            .allocated_accounts_data_size
-            .saturating_sub(tx_cost.allocated_accounts_data_size());
-        self.transaction_count = self.transaction_count.saturating_sub(1);
-        self.transaction_signature_count = self
-            .transaction_signature_count
-            .saturating_sub(tx_cost.num_transaction_signatures());
-        self.secp256k1_instruction_signature_count = self
-            .secp256k1_instruction_signature_count
-            .saturating_sub(tx_cost.num_secp256k1_instruction_signatures());
-        self.ed25519_instruction_signature_count = self
-            .ed25519_instruction_signature_count
-            .saturating_sub(tx_cost.num_ed25519_instruction_signatures());
+        self.allocated_accounts_data_size -= tx_cost.allocated_accounts_data_size();
+        self.transaction_count -= 1;
+        self.transaction_signature_count -= tx_cost.num_transaction_signatures();
+        self.secp256k1_instruction_signature_count -=
+            tx_cost.num_secp256k1_instruction_signatures();
+        self.ed25519_instruction_signature_count -= tx_cost.num_ed25519_instruction_signatures();
+        self.secp256r1_instruction_signature_count -=
+            tx_cost.num_secp256r1_instruction_signatures();
     }
 
     /// Apply additional actual execution units to cost_tracker
     /// Return the costliest account cost that were updated by `TransactionCost`
     fn add_transaction_execution_cost(
         &mut self,
-        tx_cost: &TransactionCost,
+        tx_cost: &TransactionCost<impl TransactionWithMeta>,
         adjustment: u64,
     ) -> u64 {
         let mut costliest_account_cost = 0;
-        for account_key in tx_cost.writable_accounts().iter() {
+        for account_key in tx_cost.writable_accounts() {
             let account_cost = self
                 .cost_by_writable_accounts
                 .entry(*account_key)
@@ -359,8 +372,12 @@ impl CostTracker {
     }
 
     /// Subtract extra execution units from cost_tracker
-    fn sub_transaction_execution_cost(&mut self, tx_cost: &TransactionCost, adjustment: u64) {
-        for account_key in tx_cost.writable_accounts().iter() {
+    fn sub_transaction_execution_cost(
+        &mut self,
+        tx_cost: &TransactionCost<impl TransactionWithMeta>,
+        adjustment: u64,
+    ) {
+        for account_key in tx_cost.writable_accounts() {
             let account_cost = self
                 .cost_by_writable_accounts
                 .entry(*account_key)
@@ -386,17 +403,9 @@ impl CostTracker {
 mod tests {
     use {
         super::*,
-        crate::transaction_cost::*,
-        solana_sdk::{
-            hash::Hash,
-            reserved_account_keys::ReservedAccountKeys,
-            signature::{Keypair, Signer},
-            system_transaction,
-            transaction::{
-                MessageHash, SanitizedTransaction, SimpleAddressLoader, VersionedTransaction,
-            },
-        },
-        solana_vote_program::vote_transaction,
+        crate::transaction_cost::{WritableKeysTransaction, *},
+        solana_keypair::Keypair,
+        solana_signer::Signer,
         std::cmp,
     };
 
@@ -413,54 +422,44 @@ mod tests {
         }
     }
 
-    fn test_setup() -> (Keypair, Hash) {
+    fn test_setup() -> Keypair {
         solana_logger::setup();
-        (Keypair::new(), Hash::new_unique())
+        Keypair::new()
     }
 
-    fn build_simple_transaction(
-        mint_keypair: &Keypair,
-        start_hash: &Hash,
-    ) -> (SanitizedTransaction, TransactionCost) {
-        let keypair = Keypair::new();
-        let simple_transaction = SanitizedTransaction::from_transaction_for_tests(
-            system_transaction::transfer(mint_keypair, &keypair.pubkey(), 2, *start_hash),
-        );
-        let mut tx_cost = UsageCostDetails::new_with_capacity(1);
-        tx_cost.programs_execution_cost = 5;
-        tx_cost.writable_accounts.push(mint_keypair.pubkey());
-
-        (simple_transaction, TransactionCost::Transaction(tx_cost))
+    fn build_simple_transaction(mint_keypair: &Keypair) -> WritableKeysTransaction {
+        WritableKeysTransaction(vec![mint_keypair.pubkey()])
     }
 
-    fn build_simple_vote_transaction(
-        mint_keypair: &Keypair,
-        start_hash: &Hash,
-    ) -> (SanitizedTransaction, TransactionCost) {
-        let keypair = Keypair::new();
-        let transaction = vote_transaction::new_vote_transaction(
-            vec![42],
-            Hash::default(),
-            *start_hash,
-            mint_keypair,
-            &keypair,
-            &keypair,
-            None,
-        );
-        let vote_transaction = SanitizedTransaction::try_create(
-            VersionedTransaction::from(transaction),
-            MessageHash::Compute,
-            Some(true),
-            SimpleAddressLoader::Disabled,
-            &ReservedAccountKeys::empty_key_set(),
-        )
-        .unwrap();
+    fn simple_usage_cost_details(
+        transaction: &WritableKeysTransaction,
+        programs_execution_cost: u64,
+    ) -> UsageCostDetails<WritableKeysTransaction> {
+        UsageCostDetails {
+            transaction,
+            signature_cost: 0,
+            write_lock_cost: 0,
+            data_bytes_cost: 0,
+            programs_execution_cost,
+            loaded_accounts_data_size_cost: 0,
+            allocated_accounts_data_size: 0,
+        }
+    }
 
-        let writable_accounts = vec![mint_keypair.pubkey()];
-        (
-            vote_transaction,
-            TransactionCost::SimpleVote { writable_accounts },
-        )
+    fn simple_transaction_cost(
+        transaction: &WritableKeysTransaction,
+        programs_execution_cost: u64,
+    ) -> TransactionCost<WritableKeysTransaction> {
+        TransactionCost::Transaction(simple_usage_cost_details(
+            transaction,
+            programs_execution_cost,
+        ))
+    }
+
+    fn simple_vote_transaction_cost(
+        transaction: &WritableKeysTransaction,
+    ) -> TransactionCost<WritableKeysTransaction> {
+        TransactionCost::SimpleVote { transaction }
     }
 
     #[test]
@@ -475,8 +474,9 @@ mod tests {
 
     #[test]
     fn test_cost_tracker_ok_add_one() {
-        let (mint_keypair, start_hash) = test_setup();
-        let (_tx, tx_cost) = build_simple_transaction(&mint_keypair, &start_hash);
+        let mint_keypair = test_setup();
+        let tx = build_simple_transaction(&mint_keypair);
+        let tx_cost = simple_transaction_cost(&tx, 5);
         let cost = tx_cost.sum();
 
         // build testee to have capacity for one simple transaction
@@ -491,8 +491,9 @@ mod tests {
 
     #[test]
     fn test_cost_tracker_ok_add_one_vote() {
-        let (mint_keypair, start_hash) = test_setup();
-        let (_tx, tx_cost) = build_simple_vote_transaction(&mint_keypair, &start_hash);
+        let mint_keypair = test_setup();
+        let tx = build_simple_transaction(&mint_keypair);
+        let tx_cost = simple_vote_transaction_cost(&tx);
         let cost = tx_cost.sum();
 
         // build testee to have capacity for one simple transaction
@@ -507,8 +508,9 @@ mod tests {
 
     #[test]
     fn test_cost_tracker_add_data() {
-        let (mint_keypair, start_hash) = test_setup();
-        let (_tx, mut tx_cost) = build_simple_transaction(&mint_keypair, &start_hash);
+        let mint_keypair = test_setup();
+        let tx = build_simple_transaction(&mint_keypair);
+        let mut tx_cost = simple_transaction_cost(&tx, 5);
         if let TransactionCost::Transaction(ref mut usage_cost) = tx_cost {
             usage_cost.allocated_accounts_data_size = 1;
         } else {
@@ -521,16 +523,18 @@ mod tests {
         assert!(testee.would_fit(&tx_cost).is_ok());
         let old = testee.allocated_accounts_data_size;
         testee.add_transaction_cost(&tx_cost);
-        assert_eq!(old + 1, testee.allocated_accounts_data_size);
+        assert_eq!(old.0 + 1, testee.allocated_accounts_data_size.0);
     }
 
     #[test]
     fn test_cost_tracker_ok_add_two_same_accounts() {
-        let (mint_keypair, start_hash) = test_setup();
+        let mint_keypair = test_setup();
         // build two transactions with same signed account
-        let (_tx1, tx_cost1) = build_simple_transaction(&mint_keypair, &start_hash);
+        let tx1 = build_simple_transaction(&mint_keypair);
+        let tx_cost1 = simple_transaction_cost(&tx1, 5);
         let cost1 = tx_cost1.sum();
-        let (_tx2, tx_cost2) = build_simple_transaction(&mint_keypair, &start_hash);
+        let tx2 = build_simple_transaction(&mint_keypair);
+        let tx_cost2 = simple_transaction_cost(&tx2, 5);
         let cost2 = tx_cost2.sum();
 
         // build testee to have capacity for two simple transactions, with same accounts
@@ -551,12 +555,15 @@ mod tests {
 
     #[test]
     fn test_cost_tracker_ok_add_two_diff_accounts() {
-        let (mint_keypair, start_hash) = test_setup();
+        let mint_keypair = test_setup();
         // build two transactions with diff accounts
         let second_account = Keypair::new();
-        let (_tx1, tx_cost1) = build_simple_transaction(&mint_keypair, &start_hash);
+        let tx1 = build_simple_transaction(&mint_keypair);
+        let tx_cost1 = simple_transaction_cost(&tx1, 5);
         let cost1 = tx_cost1.sum();
-        let (_tx2, tx_cost2) = build_simple_transaction(&second_account, &start_hash);
+
+        let tx2 = build_simple_transaction(&second_account);
+        let tx_cost2 = simple_transaction_cost(&tx2, 5);
         let cost2 = tx_cost2.sum();
 
         // build testee to have capacity for two simple transactions, with same accounts
@@ -577,11 +584,13 @@ mod tests {
 
     #[test]
     fn test_cost_tracker_chain_reach_limit() {
-        let (mint_keypair, start_hash) = test_setup();
+        let mint_keypair = test_setup();
         // build two transactions with same signed account
-        let (_tx1, tx_cost1) = build_simple_transaction(&mint_keypair, &start_hash);
+        let tx1 = build_simple_transaction(&mint_keypair);
+        let tx_cost1 = simple_transaction_cost(&tx1, 5);
         let cost1 = tx_cost1.sum();
-        let (_tx2, tx_cost2) = build_simple_transaction(&mint_keypair, &start_hash);
+        let tx2 = build_simple_transaction(&mint_keypair);
+        let tx_cost2 = simple_transaction_cost(&tx2, 5);
         let cost2 = tx_cost2.sum();
 
         // build testee to have capacity for two simple transactions, but not for same accounts
@@ -599,12 +608,14 @@ mod tests {
 
     #[test]
     fn test_cost_tracker_reach_limit() {
-        let (mint_keypair, start_hash) = test_setup();
+        let mint_keypair = test_setup();
         // build two transactions with diff accounts
         let second_account = Keypair::new();
-        let (_tx1, tx_cost1) = build_simple_transaction(&mint_keypair, &start_hash);
+        let tx1 = build_simple_transaction(&mint_keypair);
+        let tx_cost1 = simple_transaction_cost(&tx1, 5);
         let cost1 = tx_cost1.sum();
-        let (_tx2, tx_cost2) = build_simple_transaction(&second_account, &start_hash);
+        let tx2 = build_simple_transaction(&second_account);
+        let tx_cost2 = simple_transaction_cost(&tx2, 5);
         let cost2 = tx_cost2.sum();
 
         // build testee to have capacity for each chain, but not enough room for both transactions
@@ -623,12 +634,14 @@ mod tests {
 
     #[test]
     fn test_cost_tracker_reach_vote_limit() {
-        let (mint_keypair, start_hash) = test_setup();
+        let mint_keypair = test_setup();
         // build two mocking vote transactions with diff accounts
         let second_account = Keypair::new();
-        let (_tx1, tx_cost1) = build_simple_vote_transaction(&mint_keypair, &start_hash);
-        let (_tx2, tx_cost2) = build_simple_vote_transaction(&second_account, &start_hash);
+        let tx1 = build_simple_transaction(&mint_keypair);
+        let tx_cost1 = simple_vote_transaction_cost(&tx1);
         let cost1 = tx_cost1.sum();
+        let tx2 = build_simple_transaction(&second_account);
+        let tx_cost2 = simple_vote_transaction_cost(&tx2);
         let cost2 = tx_cost2.sum();
 
         // build testee to have capacity for each chain, but not enough room for both votes
@@ -645,18 +658,21 @@ mod tests {
         // however there is room for none-vote tx3
         {
             let third_account = Keypair::new();
-            let (_tx3, tx_cost3) = build_simple_transaction(&third_account, &start_hash);
+            let tx3 = build_simple_transaction(&third_account);
+            let tx_cost3 = simple_transaction_cost(&tx3, 5);
             assert!(testee.would_fit(&tx_cost3).is_ok());
         }
     }
 
     #[test]
     fn test_cost_tracker_reach_data_block_limit() {
-        let (mint_keypair, start_hash) = test_setup();
+        let mint_keypair = test_setup();
         // build two transactions with diff accounts
         let second_account = Keypair::new();
-        let (_tx1, mut tx_cost1) = build_simple_transaction(&mint_keypair, &start_hash);
-        let (_tx2, mut tx_cost2) = build_simple_transaction(&second_account, &start_hash);
+        let tx1 = build_simple_transaction(&mint_keypair);
+        let mut tx_cost1 = simple_transaction_cost(&tx1, 5);
+        let tx2 = build_simple_transaction(&second_account);
+        let mut tx_cost2 = simple_transaction_cost(&tx2, 5);
         if let TransactionCost::Transaction(ref mut usage_cost) = tx_cost1 {
             usage_cost.allocated_accounts_data_size = MAX_BLOCK_ACCOUNTS_DATA_SIZE_DELTA;
         } else {
@@ -682,13 +698,16 @@ mod tests {
 
     #[test]
     fn test_cost_tracker_remove() {
-        let (mint_keypair, start_hash) = test_setup();
+        let mint_keypair = test_setup();
         // build two transactions with diff accounts
         let second_account = Keypair::new();
-        let (_tx1, tx_cost1) = build_simple_transaction(&mint_keypair, &start_hash);
-        let (_tx2, tx_cost2) = build_simple_transaction(&second_account, &start_hash);
+        let tx1 = build_simple_transaction(&mint_keypair);
+        let tx_cost1 = simple_transaction_cost(&tx1, 5);
+        let tx2 = build_simple_transaction(&second_account);
+        let tx_cost2 = simple_transaction_cost(&tx2, 5);
         let cost1 = tx_cost1.sum();
         let cost2 = tx_cost2.sum();
+
         // build testee
         let mut testee = CostTracker::new(cost1 + cost2, cost1 + cost2, cost1 + cost2);
 
@@ -725,11 +744,8 @@ mod tests {
         // | acct3 | $cost |
         // and block_cost = $cost
         {
-            let tx_cost = TransactionCost::Transaction(UsageCostDetails {
-                writable_accounts: vec![acct1, acct2, acct3],
-                programs_execution_cost: cost,
-                ..UsageCostDetails::default()
-            });
+            let transaction = WritableKeysTransaction(vec![acct1, acct2, acct3]);
+            let tx_cost = simple_transaction_cost(&transaction, cost);
             assert!(testee.try_add(&tx_cost).is_ok());
             let (_costliest_account, costliest_account_cost) = testee.find_costliest_account();
             assert_eq!(cost, testee.block_cost);
@@ -743,11 +759,8 @@ mod tests {
         // | acct3 | $cost |
         // and block_cost = $cost * 2
         {
-            let tx_cost = TransactionCost::Transaction(UsageCostDetails {
-                writable_accounts: vec![acct2],
-                programs_execution_cost: cost,
-                ..UsageCostDetails::default()
-            });
+            let transaction = WritableKeysTransaction(vec![acct2]);
+            let tx_cost = simple_transaction_cost(&transaction, cost);
             assert!(testee.try_add(&tx_cost).is_ok());
             let (costliest_account, costliest_account_cost) = testee.find_costliest_account();
             assert_eq!(cost * 2, testee.block_cost);
@@ -763,11 +776,8 @@ mod tests {
         // | acct3 | $cost |
         // and block_cost = $cost * 2
         {
-            let tx_cost = TransactionCost::Transaction(UsageCostDetails {
-                writable_accounts: vec![acct1, acct2],
-                programs_execution_cost: cost,
-                ..UsageCostDetails::default()
-            });
+            let transaction = WritableKeysTransaction(vec![acct1, acct2]);
+            let tx_cost = simple_transaction_cost(&transaction, cost);
             assert!(testee.try_add(&tx_cost).is_err());
             let (costliest_account, costliest_account_cost) = testee.find_costliest_account();
             assert_eq!(cost * 2, testee.block_cost);
@@ -787,11 +797,8 @@ mod tests {
         let block_max = account_max * 3; // for three accts
 
         let mut testee = CostTracker::new(account_max, block_max, block_max);
-        let tx_cost = TransactionCost::Transaction(UsageCostDetails {
-            writable_accounts: vec![acct1, acct2, acct3],
-            programs_execution_cost: cost,
-            ..UsageCostDetails::default()
-        });
+        let transaction = WritableKeysTransaction(vec![acct1, acct2, acct3]);
+        let tx_cost = simple_transaction_cost(&transaction, cost);
         let mut expected_block_cost = tx_cost.sum();
         let expected_tx_count = 1;
         assert!(testee.try_add(&tx_cost).is_ok());
@@ -872,16 +879,16 @@ mod tests {
         let estimated_programs_execution_cost = 100;
         let estimated_loaded_accounts_data_size_cost = 200;
         let number_writeble_accounts = 3;
-        let writable_accounts = std::iter::repeat_with(Pubkey::new_unique)
-            .take(number_writeble_accounts)
-            .collect();
+        let transaction = WritableKeysTransaction(
+            std::iter::repeat_with(Pubkey::new_unique)
+                .take(number_writeble_accounts)
+                .collect(),
+        );
 
-        let tx_cost = TransactionCost::Transaction(UsageCostDetails {
-            writable_accounts,
-            programs_execution_cost: estimated_programs_execution_cost,
-            loaded_accounts_data_size_cost: estimated_loaded_accounts_data_size_cost,
-            ..UsageCostDetails::default()
-        });
+        let mut usage_cost =
+            simple_usage_cost_details(&transaction, estimated_programs_execution_cost);
+        usage_cost.loaded_accounts_data_size_cost = estimated_loaded_accounts_data_size_cost;
+        let tx_cost = TransactionCost::Transaction(usage_cost);
         // confirm tx_cost is only made up by programs_execution_cost and
         // loaded_accounts_data_size_cost
         let estimated_tx_cost = tx_cost.sum();
@@ -920,7 +927,7 @@ mod tests {
                 for writable_account_cost in cost_tracker.cost_by_writable_accounts.values() {
                     assert_eq!(expected_cost, *writable_account_cost);
                 }
-                assert_eq!(1, cost_tracker.transaction_count);
+                assert_eq!(1, cost_tracker.transaction_count.0);
             };
 
         test_update_cost_tracker(0, 0);
@@ -939,26 +946,22 @@ mod tests {
         let mut cost_tracker = CostTracker::default();
 
         let cost = 100u64;
-        let tx_cost = TransactionCost::Transaction(UsageCostDetails {
-            writable_accounts: vec![Pubkey::new_unique()],
-            programs_execution_cost: cost,
-            ..UsageCostDetails::default()
-        });
-
+        let transaction = WritableKeysTransaction(vec![Pubkey::new_unique()]);
+        let tx_cost = simple_transaction_cost(&transaction, cost);
         cost_tracker.add_transaction_cost(&tx_cost);
         // assert cost_tracker is reverted to default
-        assert_eq!(1, cost_tracker.transaction_count);
+        assert_eq!(1, cost_tracker.transaction_count.0);
         assert_eq!(1, cost_tracker.number_of_accounts());
         assert_eq!(cost, cost_tracker.block_cost);
         assert_eq!(0, cost_tracker.vote_cost);
-        assert_eq!(0, cost_tracker.allocated_accounts_data_size);
+        assert_eq!(0, cost_tracker.allocated_accounts_data_size.0);
 
         cost_tracker.remove_transaction_cost(&tx_cost);
         // assert cost_tracker is reverted to default
-        assert_eq!(0, cost_tracker.transaction_count);
+        assert_eq!(0, cost_tracker.transaction_count.0);
         assert_eq!(0, cost_tracker.number_of_accounts());
         assert_eq!(0, cost_tracker.block_cost);
         assert_eq!(0, cost_tracker.vote_cost);
-        assert_eq!(0, cost_tracker.allocated_accounts_data_size);
+        assert_eq!(0, cost_tracker.allocated_accounts_data_size.0);
     }
 }

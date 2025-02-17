@@ -10,8 +10,11 @@ use {
         sorted_storages::SortedStorages,
     },
     rayon::prelude::*,
+    solana_account::ReadableAccount as _,
+    solana_clock::Slot,
+    solana_hash::Hash,
     solana_measure::{measure::Measure, measure_us},
-    solana_sdk::{account::ReadableAccount as _, clock::Slot, hash::Hash, pubkey::Pubkey},
+    solana_pubkey::Pubkey,
     std::{
         hash::{DefaultHasher, Hash as _, Hasher as _},
         ops::Range,
@@ -55,7 +58,7 @@ struct ScanState<'a> {
     stats_num_zero_lamport_accounts_ancient: Arc<AtomicU64>,
 }
 
-impl<'a> AppendVecScan for ScanState<'a> {
+impl AppendVecScan for ScanState<'_> {
     fn set_slot(&mut self, slot: Slot, is_ancient: bool) {
         self.current_slot = slot;
         self.is_ancient = is_ancient;
@@ -183,12 +186,18 @@ impl AccountsDb {
     where
         S: AppendVecScan,
     {
-        let oldest_non_ancient_slot = self.get_oldest_non_ancient_slot_for_hash_calc_scan(
-            snapshot_storages.max_slot_inclusive(),
-            config,
-        );
-        let splitter = SplitAncientStorages::new(oldest_non_ancient_slot, snapshot_storages);
-
+        let oldest_non_ancient_slot_for_split = self
+            .get_oldest_non_ancient_slot_for_hash_calc_scan(
+                snapshot_storages.max_slot_inclusive(),
+                config,
+            );
+        let splitter =
+            SplitAncientStorages::new(oldest_non_ancient_slot_for_split, snapshot_storages);
+        let oldest_non_ancient_slot_for_identification = self
+            .get_oldest_non_ancient_slot_from_slot(
+                config.epoch_schedule,
+                snapshot_storages.max_slot_inclusive(),
+            );
         let slots_per_epoch = config
             .rent_collector
             .epoch_schedule
@@ -297,10 +306,7 @@ impl AccountsDb {
                         let mut init_accum = true;
                         // load from cache failed, so create the cache file for this chunk
                         for (slot, storage) in snapshot_storages.iter_range(&range_this_chunk) {
-                            let ancient =
-                                oldest_non_ancient_slot.is_some_and(|oldest_non_ancient_slot| {
-                                    slot < oldest_non_ancient_slot
-                                });
+                            let ancient = slot < oldest_non_ancient_slot_for_identification;
 
                             let (_, scan_us) = measure_us!(if let Some(storage) = storage {
                                 if init_accum {
@@ -373,7 +379,7 @@ mod tests {
             append_vec::AppendVec,
             cache_hash_data::{CacheHashDataFile, DeletionPolicy as CacheHashDeletionPolicy},
         },
-        solana_sdk::account::AccountSharedData,
+        solana_account::AccountSharedData,
         tempfile::TempDir,
         test_case::test_case,
     };
@@ -527,7 +533,7 @@ mod tests {
         data.accounts = av;
 
         let storage = Arc::new(data);
-        let pubkey = solana_sdk::pubkey::new_rand();
+        let pubkey = solana_pubkey::new_rand();
         let acc = AccountSharedData::new(1, 48, AccountSharedData::default().owner());
         let mark_alive = false;
         append_single_account_with_default_hash(&storage, &pubkey, &acc, mark_alive, None);
@@ -580,8 +586,8 @@ mod tests {
         let tf = crate::append_vec::test_utils::get_append_vec_path(
             "test_accountsdb_scan_account_storage_no_bank",
         );
-        let pubkey1 = solana_sdk::pubkey::new_rand();
-        let pubkey2 = solana_sdk::pubkey::new_rand();
+        let pubkey1 = solana_pubkey::new_rand();
+        let pubkey2 = solana_pubkey::new_rand();
         let mark_alive = false;
         let storage = sample_storage_with_entries(&tf, slot_expected, &pubkey1, mark_alive);
         let lamports = storage
@@ -628,7 +634,7 @@ mod tests {
                 accounts_file_provider,
             );
             let storage = Arc::new(data);
-            let pubkey = solana_sdk::pubkey::new_rand();
+            let pubkey = solana_pubkey::new_rand();
             let acc = AccountSharedData::new(1, 48, AccountSharedData::default().owner());
             let mark_alive = false;
             append_single_account_with_default_hash(&storage, &pubkey, &acc, mark_alive, None);

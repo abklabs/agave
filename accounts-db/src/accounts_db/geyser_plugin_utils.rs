@@ -1,10 +1,11 @@
 use {
     crate::{account_storage::meta::StoredAccountMeta, accounts_db::AccountsDb},
+    solana_account::AccountSharedData,
+    solana_clock::Slot,
     solana_measure::measure::Measure,
     solana_metrics::*,
-    solana_sdk::{
-        account::AccountSharedData, clock::Slot, pubkey::Pubkey, transaction::SanitizedTransaction,
-    },
+    solana_pubkey::Pubkey,
+    solana_transaction::sanitized::SanitizedTransaction,
     std::collections::{HashMap, HashSet},
 };
 
@@ -35,45 +36,44 @@ impl GeyserPluginNotifyAtSnapshotRestoreStats {
 }
 
 impl AccountsDb {
-    /// Notify the plugins of of account data when AccountsDb is restored from a snapshot. The data is streamed
+    /// Notify the plugins of account data when AccountsDb is restored from a snapshot. The data is streamed
     /// in the reverse order of the slots so that an account is only streamed once. At a slot, if the accounts is updated
     /// multiple times only the last write (with highest write_version) is notified.
     pub fn notify_account_restore_from_snapshot(&self) {
-        if self.accounts_update_notifier.is_none() {
+        let Some(accounts_update_notifier) = &self.accounts_update_notifier else {
             return;
-        }
+        };
 
-        let mut slots = self.storage.all_slots();
-        let mut notified_accounts: HashSet<Pubkey> = HashSet::default();
         let mut notify_stats = GeyserPluginNotifyAtSnapshotRestoreStats::default();
+        if accounts_update_notifier.snapshot_notifications_enabled() {
+            let mut slots = self.storage.all_slots();
+            let mut notified_accounts: HashSet<Pubkey> = HashSet::default();
 
-        slots.sort_by(|a, b| b.cmp(a));
-        for slot in slots {
-            self.notify_accounts_in_slot(slot, &mut notified_accounts, &mut notify_stats);
+            slots.sort_by(|a, b| b.cmp(a));
+            for slot in slots {
+                self.notify_accounts_in_slot(slot, &mut notified_accounts, &mut notify_stats);
+            }
         }
 
-        let accounts_update_notifier = self.accounts_update_notifier.as_ref().unwrap();
         accounts_update_notifier.notify_end_of_restore_from_snapshot();
         notify_stats.report();
     }
 
-    pub fn notify_account_at_accounts_update<P>(
+    pub fn notify_account_at_accounts_update(
         &self,
         slot: Slot,
         account: &AccountSharedData,
         txn: &Option<&SanitizedTransaction>,
         pubkey: &Pubkey,
-        write_version_producer: &mut P,
-    ) where
-        P: Iterator<Item = u64>,
-    {
+        write_version: u64,
+    ) {
         if let Some(accounts_update_notifier) = &self.accounts_update_notifier {
             accounts_update_notifier.notify_account_update(
                 slot,
                 account,
                 txn,
                 pubkey,
-                write_version_producer.next().unwrap(),
+                write_version,
             );
         }
     }
@@ -173,12 +173,10 @@ pub mod tests {
             },
         },
         dashmap::DashMap,
-        solana_sdk::{
-            account::{AccountSharedData, ReadableAccount},
-            clock::Slot,
-            pubkey::Pubkey,
-            transaction::SanitizedTransaction,
-        },
+        solana_account::{AccountSharedData, ReadableAccount},
+        solana_clock::Slot,
+        solana_pubkey::Pubkey,
+        solana_transaction::sanitized::SanitizedTransaction,
         std::sync::{
             atomic::{AtomicBool, Ordering},
             Arc,
@@ -198,6 +196,10 @@ pub mod tests {
     }
 
     impl AccountsUpdateNotifierInterface for GeyserTestPlugin {
+        fn snapshot_notifications_enabled(&self) -> bool {
+            true
+        }
+
         /// Notified when an account is updated at runtime, due to transaction activities
         fn notify_account_update(
             &self,
@@ -231,7 +233,7 @@ pub mod tests {
     fn test_notify_account_restore_from_snapshot_once_per_slot() {
         let mut accounts = AccountsDb::new_single_for_tests();
         // Account with key1 is updated twice in the store -- should only get notified once.
-        let key1 = solana_sdk::pubkey::new_rand();
+        let key1 = solana_pubkey::new_rand();
         let mut account1_lamports: u64 = 1;
         let account1 =
             AccountSharedData::new(account1_lamports, 1, AccountSharedData::default().owner());
@@ -243,7 +245,7 @@ pub mod tests {
         accounts.store_uncached(slot0, &[(&key1, &account1)]);
         let notifier = GeyserTestPlugin::default();
 
-        let key2 = solana_sdk::pubkey::new_rand();
+        let key2 = solana_pubkey::new_rand();
         let account2_lamports: u64 = 100;
         let account2 =
             AccountSharedData::new(account2_lamports, 1, AccountSharedData::default().owner());
@@ -281,14 +283,14 @@ pub mod tests {
         // Account with key1 is updated twice in two different slots -- should only get notified once.
         // Account with key2 is updated slot0, should get notified once
         // Account with key3 is updated in slot1, should get notified once
-        let key1 = solana_sdk::pubkey::new_rand();
+        let key1 = solana_pubkey::new_rand();
         let mut account1_lamports: u64 = 1;
         let account1 =
             AccountSharedData::new(account1_lamports, 1, AccountSharedData::default().owner());
         let slot0 = 0;
         accounts.store_uncached(slot0, &[(&key1, &account1)]);
 
-        let key2 = solana_sdk::pubkey::new_rand();
+        let key2 = solana_pubkey::new_rand();
         let account2_lamports: u64 = 200;
         let account2 =
             AccountSharedData::new(account2_lamports, 1, AccountSharedData::default().owner());
@@ -300,7 +302,7 @@ pub mod tests {
         accounts.store_uncached(slot1, &[(&key1, &account1)]);
         let notifier = GeyserTestPlugin::default();
 
-        let key3 = solana_sdk::pubkey::new_rand();
+        let key3 = solana_pubkey::new_rand();
         let account3_lamports: u64 = 300;
         let account3 =
             AccountSharedData::new(account3_lamports, 1, AccountSharedData::default().owner());
@@ -350,14 +352,14 @@ pub mod tests {
         // Account with key1 is updated twice in two different slots -- should only get notified twice.
         // Account with key2 is updated slot0, should get notified once
         // Account with key3 is updated in slot1, should get notified once
-        let key1 = solana_sdk::pubkey::new_rand();
+        let key1 = solana_pubkey::new_rand();
         let account1_lamports1: u64 = 1;
         let account1 =
             AccountSharedData::new(account1_lamports1, 1, AccountSharedData::default().owner());
         let slot0 = 0;
         accounts.store_cached((slot0, &[(&key1, &account1)][..]), None);
 
-        let key2 = solana_sdk::pubkey::new_rand();
+        let key2 = solana_pubkey::new_rand();
         let account2_lamports: u64 = 200;
         let account2 =
             AccountSharedData::new(account2_lamports, 1, AccountSharedData::default().owner());
@@ -368,7 +370,7 @@ pub mod tests {
         let account1 = AccountSharedData::new(account1_lamports2, 1, account1.owner());
         accounts.store_cached((slot1, &[(&key1, &account1)][..]), None);
 
-        let key3 = solana_sdk::pubkey::new_rand();
+        let key3 = solana_pubkey::new_rand();
         let account3_lamports: u64 = 300;
         let account3 =
             AccountSharedData::new(account3_lamports, 1, AccountSharedData::default().owner());

@@ -8,22 +8,79 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 and follows a [Backwards Compatibility Policy](https://docs.solanalabs.com/backwards-compatibility)
 
 Release channels have their own copy of this changelog:
-* [edge - v2.1](#edge-channel)
-* [beta - v2.0](https://github.com/solana-labs/solana/blob/v2.0/CHANGELOG.md)
-* [stable - v1.18](https://github.com/solana-labs/solana/blob/v1.18/CHANGELOG.md)
+* [edge - v2.3](#edge-channel)
+* [beta - v2.2](https://github.com/anza-xyz/agave/blob/v2.2/CHANGELOG.md)
+* [stable - v2.1](https://github.com/anza-xyz/agave/blob/v2.1/CHANGELOG.md)
 
 <a name="edge-channel"></a>
-## [2.1.0] - Unreleased
+## 2.3.0 - Unreleased
+
+
+## 2.2.0
+* Breaking:
+  * Blockstore Index column format change
+    * The Blockstore Index column format has been updated. The column format written in v2.2 is compatible with v2.1, but incompatible with v2.0 and older.
+  * Snapshot format change
+    * The snapshot format has been modified to implement SIMD-215. Since only adjacent versions are guaranteed to maintain snapshot compatibility, this means snapshots created with v2.2 are compatible with v2.1 and incompatible with v2.0 and older.
+* Changes
+  * CLI:
+    * Add global `--skip-preflight` option for skipping preflight checks on all transactions sent through RPC. This flag, along with `--use-rpc`, can improve success rate with program deployments using the public RPC nodes.
+    * Add new command `solana feature revoke` for revoking pending feature activations. When a feature is activated, `solana feature revoke <feature-keypair> <cluster>` can be used to deallocate and reassign the account to the System program, undoing the operation. This can only be done before the feature becomes active.
+    * Add new variant to `--block-production-method` for `central-scheduler-greedy`. This is a simplified scheduler that has much better performance than the more strict `central-scheduler` variant.
+  * Unhide `--accounts-db-access-storages-method` for agave-validator and agave-ledger-tool and change default to `file`
+  * Remove tracer stats from banking-trace. `banking-trace` directory should be cleared when restarting on v2.2 for first time. It will not break if not cleared, but the file will be a mix of new/old format. (#4043)
+  * Add `--snapshot-zstd-compression-level` to set the compression level when archiving snapshots with zstd.
+  * Deprecate `--tower-storage` and all `--etcd-*` arguments
+  * SDK:
+    * `cargo-build-sbf`: add `--skip-tools-install` flag to avoid downloading platform tools and `--no-rustup-override` flag to not use rustup when invoking `cargo`. Useful for immutable environments like Nix.
+
+## 2.1.0
 * Breaking:
   * SDK:
-    * `cargo-build-sbf` and `cargo-build-bpf` have been deprecated for two years and have now been definitely removed.
+    * `cargo-build-bpf` and `cargo-test-bpf` have been deprecated for two years and have now been definitely removed.
        Use `cargo-build-sbf` and `cargo-test-sbf` instead.
+    * dependency: `curve25519-dalek` upgraded to new major version 4 (#1693). This causes breakage when mixing v2.0 and v2.1 Solana crates, so be sure to use all of one or the other. Please use only crates compatible with v2.1.
   * Stake:
     * removed the unreleased `redelegate` instruction processor and CLI commands (#2213)
+  * Banks-client:
+    * relax functions to use `&self` instead of `&mut self` (#2591)
+  * `agave-validator`:
+    * Remove the deprecated value of `fifo` for `--rocksdb-shred-compaction` (#3451)
 * Changes
-  * SDK: removed the `respan` macro. This was marked as "internal use only" and was no longer used internally.
+  * SDK:
+    * removed the `respan` macro. This was marked as "internal use only" and was no longer used internally.
+    * add `entrypoint_no_alloc!`, a more performant program entrypoint that avoids allocations, saving 20-30 CUs per unique account
+    * `cargo-build-sbf`: a workspace or package-level Cargo.toml may specify `tools-version` for overriding the default platform tools version when building on-chain programs. For example:
+```toml
+[package.metadata.solana]
+tools-version = "1.43"
+```
+or
+```toml
+[workspace.metadata.solana]
+tools-version = "1.43"
+```
+The order of precedence for the chosen tools version goes: `--tools-version` argument, package version, workspace version, and finally default version.
+  * `package-metadata`: specify a program's id in Cargo.toml for easy consumption by downstream users and tools using `solana-package-metadata` (#1806). For example:
+```toml
+[package.metadata.solana]
+program-id = "MyProgram1111111111111111111111111111111111"
+```
+Can be consumed in the program crate:
+```rust
+solana_package_metadata::declare_id_with_package_metadata!("solana.program-id");
+```
+This is equivalent to writing:
+```rust
+solana_pubkey::declare_id!("MyProgram1111111111111111111111111111111111");
+```
+  * `agave-validator`: Update PoH speed check to compare against current hash rate from a Bank (#2447)
+  * `solana-test-validator`: Add `--clone-feature-set` flag to mimic features from a target cluster (#2480)
+  * `solana-genesis`: the `--cluster-type` parameter now clones the feature set from the target cluster (#2587)
+  * `unified-scheduler` as default option for `--block-verification-method` (#2653)
+  * warn that `thread-local-multi-iterator` option for `--block-production-method` is deprecated (#3113)
 
-## [2.0.0]
+## 2.0.0
 * Breaking
   * SDK:
     * Support for Borsh v0.9 removed, please use v1 or v0.10 (#1440)
@@ -64,7 +121,7 @@ Release channels have their own copy of this changelog:
   * Deprecate the `fifo` option for `--rocksdb-shred-compaction` (#1882)
     * `fifo` will remain supported in v2.0 with plans to fully remove in v2.1
 
-## [1.18.0]
+## 1.18.0
 * Changes
   * Added a github check to support `changelog` label
   * The default for `--use-snapshot-archives-at-startup` is now `when-newest` (#33883)
@@ -91,7 +148,7 @@ limited backward compatibility for v0.10 and v0.9. Please upgrade to Borsh v1.
   * Operators running their own bigtable instances need to create the `entries`
     table before upgrading their warehouse nodes
 
-## [1.17.0]
+## 1.17.0
 * Changes
   * Added a changelog.
   * Added `--use-snapshot-archives-at-startup` for faster validator restarts

@@ -5,8 +5,8 @@
 use {
     solana_program::{
         account_info::AccountInfo,
-        bpf_loader_upgradeable,
         entrypoint::{ProgramResult, MAX_PERMITTED_DATA_INCREASE},
+        loader_v4,
         log::sol_log_64,
         msg,
         program::{get_return_data, invoke, invoke_signed, set_return_data},
@@ -17,7 +17,7 @@ use {
     solana_sbf_rust_invoked_dep::*,
 };
 
-solana_program::entrypoint!(process_instruction);
+solana_program::entrypoint_no_alloc!(process_instruction);
 #[allow(clippy::cognitive_complexity)]
 fn process_instruction(
     program_id: &Pubkey,
@@ -69,10 +69,7 @@ fn process_instruction(
             assert!(!accounts[INVOKED_ARGUMENT_INDEX].executable);
 
             assert_eq!(accounts[INVOKED_PROGRAM_INDEX].key, program_id);
-            assert_eq!(
-                accounts[INVOKED_PROGRAM_INDEX].owner,
-                &bpf_loader_upgradeable::id()
-            );
+            assert_eq!(accounts[INVOKED_PROGRAM_INDEX].owner, &loader_v4::id());
             assert!(!accounts[INVOKED_PROGRAM_INDEX].is_signer);
             assert!(!accounts[INVOKED_PROGRAM_INDEX].is_writable);
             assert_eq!(accounts[INVOKED_PROGRAM_INDEX].rent_epoch, u64::MAX);

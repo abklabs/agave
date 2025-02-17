@@ -18,7 +18,6 @@ solana-client = { workspace = true }
 solana-ledger = { workspace = true }
 solana-measure = { workspace = true }
 solana-merkle-tree = { workspace = true }
-solana-metrics = { workspace = true }
 solana-perf = { workspace = true }
 solana-pubsub-client = { workspace = true }
 solana-rayon-threadlimit = { workspace = true }
@@ -37,6 +36,7 @@ tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 
 [dev-dependencies]
 solana-logger = { workspace = true }
+solana-rpc = { workspace = true, features = ["dev-context-only-utils"] }
 solana-runtime = { workspace = true, features = ["dev-context-only-utils"] }
 
 [package.metadata.docs.rs]

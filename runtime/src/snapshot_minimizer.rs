@@ -9,7 +9,9 @@ use {
         prelude::ParallelSlice,
     },
     solana_accounts_db::{
-        accounts_db::{AccountStorageEntry, AccountsDb, GetUniqueAccountsResult, PurgeStats},
+        accounts_db::{
+            stats::PurgeStats, AccountStorageEntry, AccountsDb, GetUniqueAccountsResult,
+        },
         accounts_partition,
         storable_accounts::StorableAccountsBySlot,
     },
@@ -158,9 +160,8 @@ impl<'a> SnapshotMinimizer<'a> {
             .par_iter()
             .for_each(|(pubkey, (_stake, vote_account))| {
                 self.minimized_account_set.insert(*pubkey);
-                if let Ok(vote_state) = vote_account.vote_state().as_ref() {
-                    self.minimized_account_set.insert(vote_state.node_pubkey);
-                }
+                self.minimized_account_set
+                    .insert(*vote_account.node_pubkey());
             });
     }
 
@@ -269,10 +270,7 @@ impl<'a> SnapshotMinimizer<'a> {
         &self,
         minimized_slot_set: DashSet<Slot>,
     ) -> (Vec<Slot>, Vec<Arc<AccountStorageEntry>>) {
-        let snapshot_storages = self
-            .accounts_db()
-            .get_snapshot_storages(..=self.starting_slot)
-            .0;
+        let snapshot_storages = self.accounts_db().get_storages(..=self.starting_slot).0;
 
         let dead_slots = Mutex::new(Vec::new());
         let dead_storages = Mutex::new(Vec::new());
@@ -472,7 +470,7 @@ mod tests {
     fn test_minimization_get_vote_accounts() {
         solana_logger::setup();
 
-        let bootstrap_validator_pubkey = solana_sdk::pubkey::new_rand();
+        let bootstrap_validator_pubkey = solana_pubkey::new_rand();
         let bootstrap_validator_stake_lamports = 30;
         let genesis_config_info = create_genesis_config_with_leader(
             10,
@@ -502,7 +500,7 @@ mod tests {
     fn test_minimization_get_stake_accounts() {
         solana_logger::setup();
 
-        let bootstrap_validator_pubkey = solana_sdk::pubkey::new_rand();
+        let bootstrap_validator_pubkey = solana_pubkey::new_rand();
         let bootstrap_validator_stake_lamports = 30;
         let genesis_config_info = create_genesis_config_with_leader(
             10,
@@ -545,8 +543,8 @@ mod tests {
         let (genesis_config, _) = create_genesis_config(1_000_000);
         let bank = Arc::new(Bank::new_for_tests(&genesis_config));
 
-        let pubkey = solana_sdk::pubkey::new_rand();
-        let owner_pubkey = solana_sdk::pubkey::new_rand();
+        let pubkey = solana_pubkey::new_rand();
+        let owner_pubkey = solana_pubkey::new_rand();
         bank.store_account(&pubkey, &AccountSharedData::new(1, 0, &owner_pubkey));
 
         let owner_accounts = DashSet::new();
@@ -570,9 +568,9 @@ mod tests {
         let (genesis_config, _) = create_genesis_config(1_000_000);
         let bank = Arc::new(Bank::new_for_tests(&genesis_config));
 
-        let non_program_id = solana_sdk::pubkey::new_rand();
-        let program_id = solana_sdk::pubkey::new_rand();
-        let programdata_address = solana_sdk::pubkey::new_rand();
+        let non_program_id = solana_pubkey::new_rand();
+        let program_id = solana_pubkey::new_rand();
+        let programdata_address = solana_pubkey::new_rand();
 
         let program = UpgradeableLoaderState::Program {
             programdata_address,
@@ -625,7 +623,7 @@ mod tests {
         let minimized_account_set = DashSet::new();
         for _ in 0..num_slots {
             let pubkeys: Vec<_> = (0..num_accounts_per_slot)
-                .map(|_| solana_sdk::pubkey::new_rand())
+                .map(|_| solana_pubkey::new_rand())
                 .collect();
 
             let some_lamport = 223;
@@ -655,7 +653,7 @@ mod tests {
         };
         minimizer.minimize_accounts_db();
 
-        let snapshot_storages = accounts.get_snapshot_storages(..=current_slot).0;
+        let snapshot_storages = accounts.get_storages(..=current_slot).0;
         assert_eq!(snapshot_storages.len(), 3);
 
         let mut account_count = 0;

@@ -1,11 +1,11 @@
 use {
     crate::cli::CliError,
+    solana_commitment_config::CommitmentConfig,
+    solana_message::Message,
+    solana_native_token::lamports_to_sol,
+    solana_pubkey::Pubkey,
     solana_rpc_client::rpc_client::RpcClient,
     solana_rpc_client_api::client_error::{Error as ClientError, Result as ClientResult},
-    solana_sdk::{
-        commitment_config::CommitmentConfig, message::Message, native_token::lamports_to_sol,
-        pubkey::Pubkey,
-    },
 };
 
 pub fn check_account_for_fee(
@@ -178,7 +178,7 @@ mod tests {
             request::RpcRequest,
             response::{Response, RpcResponseContext},
         },
-        solana_sdk::system_instruction,
+        solana_system_interface::instruction as system_instruction,
         std::collections::HashMap,
     };
 
@@ -192,7 +192,7 @@ mod tests {
             },
             value: json!(account_balance),
         });
-        let pubkey = solana_sdk::pubkey::new_rand();
+        let pubkey = solana_pubkey::new_rand();
 
         let pubkey0 = Pubkey::from([0; 32]);
         let pubkey1 = Pubkey::from([1; 32]);
@@ -271,7 +271,7 @@ mod tests {
             },
             value: json!(account_balance),
         });
-        let pubkey = solana_sdk::pubkey::new_rand();
+        let pubkey = solana_pubkey::new_rand();
 
         let mut mocks = HashMap::new();
         mocks.insert(RpcRequest::GetBalance, account_balance_response);
@@ -325,9 +325,9 @@ mod tests {
 
     #[test]
     fn test_check_unique_pubkeys() {
-        let pubkey0 = solana_sdk::pubkey::new_rand();
+        let pubkey0 = solana_pubkey::new_rand();
         let pubkey_clone = pubkey0;
-        let pubkey1 = solana_sdk::pubkey::new_rand();
+        let pubkey1 = solana_pubkey::new_rand();
 
         check_unique_pubkeys((&pubkey0, "foo".to_string()), (&pubkey1, "bar".to_string()))
             .expect("unexpected result");

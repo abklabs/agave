@@ -26,7 +26,7 @@ to your machine by fetching the transaction count:
 solana transaction-count
 ```
 
-View the [metrics dashboard](https://metrics.solana.com:3000/d/monitor/cluster-telemetry) for more
+View the [metrics dashboard](https://metrics.solana.com:3000/d/monitor-edge/cluster-telemetry) for more
 detail on cluster activity.
 
 ## Enabling CUDA
@@ -48,10 +48,8 @@ the following commands.
 
 ```bash
 sudo bash -c "cat >/etc/sysctl.d/21-agave-validator.conf <<EOF
-# Increase UDP buffer sizes
-net.core.rmem_default = 134217728
+# Increase max UDP buffer sizes
 net.core.rmem_max = 134217728
-net.core.wmem_default = 134217728
 net.core.wmem_max = 134217728
 
 # Increase memory mapped files limit

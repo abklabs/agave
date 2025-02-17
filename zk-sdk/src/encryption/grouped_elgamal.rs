@@ -6,16 +6,22 @@
 //! A regular twisted ElGamal ciphertext consists of two components:
 //! - A Pedersen commitment that encodes a message to be encrypted
 //! - A "decryption handle" that binds the Pedersen opening to a specific public key
+//!
 //! The ciphertext can be generalized to hold not a single decryption handle, but multiple handles
 //! pertaining to multiple ElGamal public keys. These ciphertexts are referred to as a "grouped"
 //! ElGamal ciphertext.
 //!
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::encryption::{discrete_log::DiscreteLog, elgamal::ElGamalSecretKey};
+#[cfg(target_arch = "wasm32")]
+pub use grouped_elgamal_wasm::*;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::prelude::*;
 use {
     crate::{
         encryption::{
-            discrete_log::DiscreteLog,
-            elgamal::{DecryptHandle, ElGamalCiphertext, ElGamalPubkey, ElGamalSecretKey},
+            elgamal::{DecryptHandle, ElGamalCiphertext, ElGamalPubkey},
             pedersen::{Pedersen, PedersenCommitment, PedersenOpening},
         },
         RISTRETTO_POINT_LEN,
@@ -91,7 +97,10 @@ impl<const N: usize> GroupedElGamal<N> {
             handle: *handle,
         })
     }
+}
 
+#[cfg(not(target_arch = "wasm32"))]
+impl<const N: usize> GroupedElGamal<N> {
     /// Decrypts a grouped ElGamal ciphertext using an ElGamal secret key pertaining to a
     /// decryption handle at a specified index.
     ///
@@ -141,32 +150,6 @@ impl<const N: usize> GroupedElGamalCiphertext<N> {
         GroupedElGamal::to_elgamal_ciphertext(self, index)
     }
 
-    /// Decrypts the grouped ElGamal ciphertext using an ElGamal secret key pertaining to a
-    /// specified index.
-    ///
-    /// The output of this function is of type `DiscreteLog`. To recover the originally encrypted
-    /// amount, use `DiscreteLog::decode`.
-    pub fn decrypt(
-        &self,
-        secret: &ElGamalSecretKey,
-        index: usize,
-    ) -> Result<DiscreteLog, GroupedElGamalError> {
-        GroupedElGamal::decrypt(self, secret, index)
-    }
-
-    /// Decrypts the grouped ElGamal ciphertext to a number that is interpreted as a positive 32-bit
-    /// number (but still of type `u64`).
-    ///
-    /// If the originally encrypted amount is not a positive 32-bit number, then the function
-    /// returns `None`.
-    pub fn decrypt_u32(
-        &self,
-        secret: &ElGamalSecretKey,
-        index: usize,
-    ) -> Result<Option<u64>, GroupedElGamalError> {
-        GroupedElGamal::decrypt_u32(self, secret, index)
-    }
-
     /// The expected length of a serialized grouped ElGamal ciphertext.
     ///
     /// A grouped ElGamal ciphertext consists of a Pedersen commitment and an array of decryption
@@ -205,6 +188,109 @@ impl<const N: usize> GroupedElGamalCiphertext<N> {
             commitment,
             handles: handles.try_into().unwrap(),
         })
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<const N: usize> GroupedElGamalCiphertext<N> {
+    /// Decrypts the grouped ElGamal ciphertext using an ElGamal secret key pertaining to a
+    /// specified index.
+    ///
+    /// The output of this function is of type `DiscreteLog`. To recover the originally encrypted
+    /// amount, use `DiscreteLog::decode`.
+    pub fn decrypt(
+        &self,
+        secret: &ElGamalSecretKey,
+        index: usize,
+    ) -> Result<DiscreteLog, GroupedElGamalError> {
+        GroupedElGamal::decrypt(self, secret, index)
+    }
+
+    /// Decrypts the grouped ElGamal ciphertext to a number that is interpreted as a positive 32-bit
+    /// number (but still of type `u64`).
+    ///
+    /// If the originally encrypted amount is not a positive 32-bit number, then the function
+    /// returns `None`.
+    pub fn decrypt_u32(
+        &self,
+        secret: &ElGamalSecretKey,
+        index: usize,
+    ) -> Result<Option<u64>, GroupedElGamalError> {
+        GroupedElGamal::decrypt_u32(self, secret, index)
+    }
+}
+
+// Define specific grouped ElGamal ciphertext types for 2 and 3 handles since
+// `wasm_bindgen` do not yet support the export of types that take on generic
+// type parameters.
+#[cfg(target_arch = "wasm32")]
+mod grouped_elgamal_wasm {
+    use super::*;
+
+    #[wasm_bindgen]
+    pub struct GroupedElGamalCiphertext2Handles(pub(crate) GroupedElGamalCiphertext<2>);
+
+    #[wasm_bindgen]
+    impl GroupedElGamalCiphertext2Handles {
+        #[wasm_bindgen(js_name = encryptU64)]
+        pub fn encrypt_u64(
+            first_pubkey: &ElGamalPubkey,
+            second_pubkey: &ElGamalPubkey,
+            amount: u64,
+        ) -> Self {
+            Self(GroupedElGamal::<2>::encrypt(
+                [first_pubkey, second_pubkey],
+                amount,
+            ))
+        }
+
+        #[wasm_bindgen(js_name = encryptionWithU64)]
+        pub fn encryption_with_u64(
+            first_pubkey: &ElGamalPubkey,
+            second_pubkey: &ElGamalPubkey,
+            amount: u64,
+            opening: &PedersenOpening,
+        ) -> Self {
+            Self(GroupedElGamal::<2>::encrypt_with(
+                [first_pubkey, second_pubkey],
+                amount,
+                opening,
+            ))
+        }
+    }
+
+    #[wasm_bindgen]
+    pub struct GroupedElGamalCiphertext3Handles(pub(crate) GroupedElGamalCiphertext<3>);
+
+    #[wasm_bindgen]
+    impl GroupedElGamalCiphertext3Handles {
+        #[wasm_bindgen(js_name = encryptU64)]
+        pub fn encrypt_u64(
+            first_pubkey: &ElGamalPubkey,
+            second_pubkey: &ElGamalPubkey,
+            third_pubkey: &ElGamalPubkey,
+            amount: u64,
+        ) -> Self {
+            Self(GroupedElGamal::<3>::encrypt(
+                [first_pubkey, second_pubkey, third_pubkey],
+                amount,
+            ))
+        }
+
+        #[wasm_bindgen(js_name = encryptionWithU64)]
+        pub fn encryption_with_u64(
+            first_pubkey: &ElGamalPubkey,
+            second_pubkey: &ElGamalPubkey,
+            third_pubkey: &ElGamalPubkey,
+            amount: u64,
+            opening: &PedersenOpening,
+        ) -> Self {
+            Self(GroupedElGamal::<3>::encrypt_with(
+                [first_pubkey, second_pubkey, third_pubkey],
+                amount,
+                opening,
+            ))
+        }
     }
 }
 

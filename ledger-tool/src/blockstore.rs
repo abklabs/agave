@@ -4,8 +4,8 @@ use {
     crate::{
         error::{LedgerToolError, Result},
         ledger_path::canonicalize_ledger_path,
-        ledger_utils::{get_program_ids, get_shred_storage_type},
-        output::{output_ledger, output_slot, SlotBounds, SlotInfo},
+        ledger_utils::get_program_ids,
+        output::{output_ledger, output_slot, CliDuplicateSlotProof, SlotBounds, SlotInfo},
     },
     chrono::{DateTime, Utc},
     clap::{
@@ -19,9 +19,11 @@ use {
     solana_cli_output::OutputFormat,
     solana_ledger::{
         ancestor_iterator::AncestorIterator,
-        blockstore::{Blockstore, PurgeType},
-        blockstore_db::{self, Column, ColumnName, Database},
-        blockstore_options::{AccessType, BLOCKSTORE_DIRECTORY_ROCKS_FIFO},
+        blockstore::{
+            column::{Column, ColumnName},
+            Blockstore, PurgeType,
+        },
+        blockstore_options::AccessType,
         shred::Shred,
     },
     solana_sdk::{
@@ -38,21 +40,17 @@ use {
     },
 };
 
-fn analyze_column<
-    C: solana_ledger::blockstore_db::Column + solana_ledger::blockstore_db::ColumnName,
->(
-    db: &Database,
-    name: &str,
-) -> Result<()> {
+fn analyze_column(blockstore: &Blockstore, column_name: &str) -> Result<()> {
     let mut key_len: u64 = 0;
     let mut key_tot: u64 = 0;
     let mut val_hist = histogram::Histogram::new();
     let mut val_tot: u64 = 0;
     let mut row_hist = histogram::Histogram::new();
-    for (key, val) in db.iter::<C>(blockstore_db::IteratorMode::Start)? {
+    let column_iterator = blockstore.iterator_cf(column_name)?;
+    for (key, val) in column_iterator {
         // Key length is fixed, only need to calculate it once
         if key_len == 0 {
-            key_len = C::key(key).len() as u64;
+            key_len = key.len() as u64;
         }
         let val_len = val.len() as u64;
 
@@ -65,7 +63,7 @@ fn analyze_column<
 
     let json_result = if val_hist.entries() > 0 {
         json!({
-            "column":name,
+            "column":column_name,
             "entries":val_hist.entries(),
             "key_stats":{
                 "max":key_len,
@@ -94,7 +92,7 @@ fn analyze_column<
         })
     } else {
         json!({
-        "column":name,
+        "column":column_name,
         "entries":val_hist.entries(),
         "key_stats":{
             "max":key_len,
@@ -113,32 +111,32 @@ fn analyze_column<
     Ok(())
 }
 
-fn analyze_storage(database: &Database) -> Result<()> {
-    use solana_ledger::blockstore_db::columns::*;
-    analyze_column::<SlotMeta>(database, "SlotMeta")?;
-    analyze_column::<Orphans>(database, "Orphans")?;
-    analyze_column::<DeadSlots>(database, "DeadSlots")?;
-    analyze_column::<DuplicateSlots>(database, "DuplicateSlots")?;
-    analyze_column::<ErasureMeta>(database, "ErasureMeta")?;
-    analyze_column::<BankHash>(database, "BankHash")?;
-    analyze_column::<Root>(database, "Root")?;
-    analyze_column::<Index>(database, "Index")?;
-    analyze_column::<ShredData>(database, "ShredData")?;
-    analyze_column::<ShredCode>(database, "ShredCode")?;
-    analyze_column::<TransactionStatus>(database, "TransactionStatus")?;
-    analyze_column::<AddressSignatures>(database, "AddressSignatures")?;
-    analyze_column::<TransactionMemos>(database, "TransactionMemos")?;
-    analyze_column::<TransactionStatusIndex>(database, "TransactionStatusIndex")?;
-    analyze_column::<Rewards>(database, "Rewards")?;
-    analyze_column::<Blocktime>(database, "Blocktime")?;
-    analyze_column::<PerfSamples>(database, "PerfSamples")?;
-    analyze_column::<BlockHeight>(database, "BlockHeight")?;
-    analyze_column::<ProgramCosts>(database, "ProgramCosts")?;
-    analyze_column::<OptimisticSlots>(database, "OptimisticSlots")
+fn analyze_storage(blockstore: &Blockstore) -> Result<()> {
+    use solana_ledger::blockstore::column::columns::*;
+    analyze_column(blockstore, SlotMeta::NAME)?;
+    analyze_column(blockstore, Orphans::NAME)?;
+    analyze_column(blockstore, DeadSlots::NAME)?;
+    analyze_column(blockstore, DuplicateSlots::NAME)?;
+    analyze_column(blockstore, ErasureMeta::NAME)?;
+    analyze_column(blockstore, BankHash::NAME)?;
+    analyze_column(blockstore, Root::NAME)?;
+    analyze_column(blockstore, Index::NAME)?;
+    analyze_column(blockstore, ShredData::NAME)?;
+    analyze_column(blockstore, ShredCode::NAME)?;
+    analyze_column(blockstore, TransactionStatus::NAME)?;
+    analyze_column(blockstore, AddressSignatures::NAME)?;
+    analyze_column(blockstore, TransactionMemos::NAME)?;
+    analyze_column(blockstore, TransactionStatusIndex::NAME)?;
+    analyze_column(blockstore, Rewards::NAME)?;
+    analyze_column(blockstore, Blocktime::NAME)?;
+    analyze_column(blockstore, PerfSamples::NAME)?;
+    analyze_column(blockstore, BlockHeight::NAME)?;
+    analyze_column(blockstore, ProgramCosts::NAME)?;
+    analyze_column(blockstore, OptimisticSlots::NAME)
 }
 
 fn raw_key_to_slot(key: &[u8], column_name: &str) -> Option<Slot> {
-    use solana_ledger::blockstore_db::columns as cf;
+    use solana_ledger::blockstore::column::columns as cf;
     match column_name {
         cf::SlotMeta::NAME => Some(cf::SlotMeta::slot(cf::SlotMeta::index(key))),
         cf::Orphans::NAME => Some(cf::Orphans::slot(cf::Orphans::index(key))),
@@ -602,9 +600,11 @@ fn do_blockstore_process_command(ledger_path: &Path, matches: &ArgMatches<'_>) -
     let verbose_level = matches.occurrences_of("verbose");
 
     match matches.subcommand() {
-        ("analyze-storage", Some(arg_matches)) => analyze_storage(
-            &crate::open_blockstore(&ledger_path, arg_matches, AccessType::Secondary).db(),
-        )?,
+        ("analyze-storage", Some(arg_matches)) => analyze_storage(&crate::open_blockstore(
+            &ledger_path,
+            arg_matches,
+            AccessType::Secondary,
+        ))?,
         ("bounds", Some(arg_matches)) => {
             let output_format = OutputFormat::from_matches(arg_matches, "output_format", false);
             let all = arg_matches.is_present("all");
@@ -669,22 +669,8 @@ fn do_blockstore_process_command(ledger_path: &Path, matches: &ArgMatches<'_>) -
             let target_db = PathBuf::from(value_t_or_exit!(arg_matches, "target_db", String));
 
             let source = crate::open_blockstore(&ledger_path, arg_matches, AccessType::Secondary);
-
-            // Check if shred storage type can be inferred; if not, a new
-            // ledger is being created. open_blockstore() will attempt to
-            // to infer shred storage type as well, but this check provides
-            // extra insight to user on how to create a FIFO ledger.
-            let _ = get_shred_storage_type(
-                &target_db,
-                &format!(
-                    "No --target-db ledger at {:?} was detected, default compaction \
-                 (RocksLevel) will be used. Fifo compaction can be enabled for a new \
-                 ledger by manually creating {BLOCKSTORE_DIRECTORY_ROCKS_FIFO} directory \
-                 within the specified --target_db directory.",
-                    &target_db
-                ),
-            );
             let target = crate::open_blockstore(&target_db, arg_matches, AccessType::Primary);
+
             for (slot, _meta) in source.slot_meta_iterator(starting_slot)? {
                 if slot > ending_slot {
                     break;
@@ -707,8 +693,15 @@ fn do_blockstore_process_command(ledger_path: &Path, matches: &ArgMatches<'_>) -
             let blockstore =
                 crate::open_blockstore(&ledger_path, arg_matches, AccessType::Secondary);
             let starting_slot = value_t_or_exit!(arg_matches, "starting_slot", Slot);
+            let output_format =
+                OutputFormat::from_matches(arg_matches, "output_format", verbose_level > 1);
             for slot in blockstore.duplicate_slots_iterator(starting_slot)? {
                 println!("{slot}");
+                if verbose_level > 0 {
+                    let proof = blockstore.get_duplicate_slot(slot).unwrap();
+                    let cli_duplicate_proof = CliDuplicateSlotProof::from(proof);
+                    println!("{}", output_format.formatted_string(&cli_duplicate_proof));
+                }
             }
         }
         ("latest-optimistic-slots", Some(arg_matches)) => {
@@ -1024,7 +1017,6 @@ fn do_blockstore_process_command(ledger_path: &Path, matches: &ArgMatches<'_>) -
             let blockstore =
                 crate::open_blockstore(&ledger_path, arg_matches, AccessType::Secondary);
             for slot in slots {
-                println!("Slot {slot}");
                 output_slot(
                     &blockstore,
                     slot,

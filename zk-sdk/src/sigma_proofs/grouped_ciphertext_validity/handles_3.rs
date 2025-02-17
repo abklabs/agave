@@ -8,6 +8,8 @@
 //! The protocol guarantees computational soundness (by the hardness of discrete log) and perfect
 //! zero-knowledge in the random oracle model.
 
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::prelude::*;
 #[cfg(not(target_os = "solana"))]
 use {
     crate::{
@@ -41,6 +43,7 @@ const GROUPED_CIPHERTEXT_3_HANDLES_VALIDITY_PROOF_LEN: usize = UNIT_LEN * 6;
 /// The grouped ciphertext validity proof for 3 handles.
 ///
 /// Contains all the elliptic curve and scalar components that make up the sigma protocol.
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 #[allow(non_snake_case)]
 #[derive(Clone)]
 pub struct GroupedCiphertext3HandlesValidityProof {
@@ -197,7 +200,7 @@ impl GroupedCiphertext3HandlesValidityProof {
                 &self.z_r,            // z_r
                 &self.z_x,            // z_x
                 &(-&c),               // -c
-                &-(&Scalar::one()),   // -identity
+                &-(&Scalar::ONE),     // -identity
                 &(&w * &self.z_r),    // w * z_r
                 &(&w_negated * &c),   // -w * c
                 &w_negated,           // -w
@@ -268,7 +271,18 @@ impl GroupedCiphertext3HandlesValidityProof {
 mod test {
     use {
         super::*,
-        crate::encryption::{elgamal::ElGamalKeypair, pedersen::Pedersen},
+        crate::{
+            encryption::{
+                elgamal::ElGamalKeypair,
+                pedersen::Pedersen,
+                pod::{
+                    elgamal::{PodDecryptHandle, PodElGamalCiphertext, PodElGamalPubkey},
+                    pedersen::PodPedersenCommitment,
+                },
+            },
+            sigma_proofs::pod::PodGroupedCiphertext3HandlesValidityProof,
+        },
+        std::str::FromStr,
     };
 
     #[test]
@@ -301,7 +315,7 @@ mod test {
             &mut prover_transcript,
         );
 
-        assert!(proof
+        proof
             .verify(
                 &commitment,
                 first_pubkey,
@@ -312,7 +326,7 @@ mod test {
                 &third_handle,
                 &mut verifier_transcript,
             )
-            .is_ok());
+            .unwrap();
     }
 
     #[test]
@@ -386,7 +400,7 @@ mod test {
             &mut prover_transcript,
         );
 
-        assert!(proof
+        proof
             .verify(
                 &commitment,
                 first_pubkey,
@@ -397,7 +411,7 @@ mod test {
                 &third_handle,
                 &mut verifier_transcript,
             )
-            .is_ok());
+            .unwrap();
 
         // decryption handles can be zero as long as the Pedersen commitment is valid
         let first_keypair = ElGamalKeypair::new_rand();
@@ -430,7 +444,7 @@ mod test {
             &mut prover_transcript,
         );
 
-        assert!(proof
+        proof
             .verify(
                 &commitment,
                 first_pubkey,
@@ -441,6 +455,56 @@ mod test {
                 &third_handle,
                 &mut verifier_transcript,
             )
-            .is_ok());
+            .unwrap();
+    }
+
+    #[test]
+    fn test_grouped_ciphertext_3_handles_validity_proof_string() {
+        let commitment_str = "DDSCVZLH+eqC9gX+ZeP3HQQxigojAOgda3YwVChR5W4=";
+        let pod_commitment = PodPedersenCommitment::from_str(commitment_str).unwrap();
+        let commitment: PedersenCommitment = pod_commitment.try_into().unwrap();
+
+        let first_pubkey_str = "yGGJnLUs8B744So/Ua3n2wNm+8u9ey/6KrDdHx4ySwk=";
+        let pod_first_pubkey = PodElGamalPubkey::from_str(first_pubkey_str).unwrap();
+        let first_pubkey: ElGamalPubkey = pod_first_pubkey.try_into().unwrap();
+
+        let second_pubkey_str = "ZFETe85sZdWpxLAo177kwiOxZCpsXGeyZEnzern7tAk=";
+        let pod_second_pubkey = PodElGamalPubkey::from_str(second_pubkey_str).unwrap();
+        let second_pubkey: ElGamalPubkey = pod_second_pubkey.try_into().unwrap();
+
+        let third_pubkey_str = "duUYiBx0l0jRRPsTLCoCD8PIKFczPdrxl+2f4eCflhQ=";
+        let pod_third_pubkey = PodElGamalPubkey::from_str(third_pubkey_str).unwrap();
+        let third_pubkey: ElGamalPubkey = pod_third_pubkey.try_into().unwrap();
+
+        let first_handle_str = "Asor2klomf847EmJZmXn3qoi0SGE3cBXCkKttbJa+lE=";
+        let pod_first_handle_str = PodDecryptHandle::from_str(first_handle_str).unwrap();
+        let first_handle: DecryptHandle = pod_first_handle_str.try_into().unwrap();
+
+        let second_handle_str = "kJ0GYHDVeB1Kgvqp+MY/my3BYZvqsC5Mv0gQLJHnNBQ=";
+        let pod_second_handle_str = PodDecryptHandle::from_str(second_handle_str).unwrap();
+        let second_handle: DecryptHandle = pod_second_handle_str.try_into().unwrap();
+
+        let third_handle_str = "Jnd5jZLNDOMMt+kbgQWCQqTytbwHx3Bz5vwtfDLhRn0=";
+        let pod_third_handle_str = PodDecryptHandle::from_str(third_handle_str).unwrap();
+        let third_handle: DecryptHandle = pod_third_handle_str.try_into().unwrap();
+
+        let proof_str = "8NoqOM40+fvPY2aHzO0SdWZM6lvSoaqI7KpaFuE4wQUaqewILtQV8IMHeHmpevxt/GTErJsdcV8kY3HDZ1GHbMoDujYpstUhyubX1voJh/DstYAL1SQqlRpNLG+kWEUZYvCudTur7i5R+zqZQY3sRMEAxW458V+1GmyCWbWP3FZEz5gX/Pa28/ZNLBvmSPpJBZapXRI5Ra0dKPskFmQ0CH0gBWo6pxj/PH9sgNEkLrbVZB7jpVtdmNzivwgFeb4M";
+        let pod_proof = PodGroupedCiphertext3HandlesValidityProof::from_str(proof_str).unwrap();
+        let proof: GroupedCiphertext3HandlesValidityProof = pod_proof.try_into().unwrap();
+
+        let mut verifier_transcript = Transcript::new(b"Test");
+
+        proof
+            .verify(
+                &commitment,
+                &first_pubkey,
+                &second_pubkey,
+                &third_pubkey,
+                &first_handle,
+                &second_handle,
+                &third_handle,
+                &mut verifier_transcript,
+            )
+            .unwrap();
     }
 }

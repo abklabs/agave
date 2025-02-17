@@ -1,12 +1,13 @@
 use {
-    crate::account_storage::meta::StoredAccountMeta,
-    solana_sdk::{
-        account::AccountSharedData, clock::Slot, pubkey::Pubkey, transaction::SanitizedTransaction,
-    },
+    crate::account_storage::meta::StoredAccountMeta, solana_account::AccountSharedData,
+    solana_clock::Slot, solana_pubkey::Pubkey, solana_transaction::sanitized::SanitizedTransaction,
     std::sync::Arc,
 };
 
 pub trait AccountsUpdateNotifierInterface: std::fmt::Debug {
+    /// Enable account notifications from snapshot
+    fn snapshot_notifications_enabled(&self) -> bool;
+
     /// Notified when an account is updated at runtime, due to transaction activities
     fn notify_account_update(
         &self,

@@ -2,6 +2,8 @@
 
 #[cfg(not(target_os = "solana"))]
 use crate::encryption::grouped_elgamal::GroupedElGamalCiphertext;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::prelude::*;
 use {
     crate::{
         encryption::{
@@ -9,10 +11,18 @@ use {
             DECRYPT_HANDLE_LEN, ELGAMAL_CIPHERTEXT_LEN, PEDERSEN_COMMITMENT_LEN,
         },
         errors::ElGamalError,
+        pod::{impl_from_bytes, impl_from_str},
     },
+    base64::{prelude::BASE64_STANDARD, Engine},
     bytemuck::Zeroable,
     std::fmt,
 };
+
+/// Maximum length of a base64 encoded grouped ElGamal ciphertext with 2 handles
+const GROUPED_ELGAMAL_CIPHERTEXT_2_HANDLES_MAX_BASE64_LEN: usize = 132;
+
+/// Maximum length of a base64 encoded grouped ElGamal ciphertext with 3 handles
+const GROUPED_ELGAMAL_CIPHERTEXT_3_HANDLES_MAX_BASE64_LEN: usize = 176;
 
 macro_rules! impl_extract {
     (TYPE = $type:ident) => {
@@ -61,6 +71,7 @@ const GROUPED_ELGAMAL_CIPHERTEXT_3_HANDLES: usize =
     PEDERSEN_COMMITMENT_LEN + DECRYPT_HANDLE_LEN + DECRYPT_HANDLE_LEN + DECRYPT_HANDLE_LEN;
 
 /// The `GroupedElGamalCiphertext` type with two decryption handles as a `Pod`
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 #[derive(Clone, Copy, bytemuck_derive::Pod, bytemuck_derive::Zeroable, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct PodGroupedElGamalCiphertext2Handles(
@@ -78,6 +89,24 @@ impl Default for PodGroupedElGamalCiphertext2Handles {
         Self::zeroed()
     }
 }
+
+impl fmt::Display for PodGroupedElGamalCiphertext2Handles {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", BASE64_STANDARD.encode(self.0))
+    }
+}
+
+impl_from_str!(
+    TYPE = PodGroupedElGamalCiphertext2Handles,
+    BYTES_LEN = GROUPED_ELGAMAL_CIPHERTEXT_2_HANDLES,
+    BASE64_LEN = GROUPED_ELGAMAL_CIPHERTEXT_2_HANDLES_MAX_BASE64_LEN
+);
+
+impl_from_bytes!(
+    TYPE = PodGroupedElGamalCiphertext2Handles,
+    BYTES_LEN = GROUPED_ELGAMAL_CIPHERTEXT_2_HANDLES
+);
+
 #[cfg(not(target_os = "solana"))]
 impl From<GroupedElGamalCiphertext<2>> for PodGroupedElGamalCiphertext2Handles {
     fn from(decoded_ciphertext: GroupedElGamalCiphertext<2>) -> Self {
@@ -97,6 +126,7 @@ impl TryFrom<PodGroupedElGamalCiphertext2Handles> for GroupedElGamalCiphertext<2
 impl_extract!(TYPE = PodGroupedElGamalCiphertext2Handles);
 
 /// The `GroupedElGamalCiphertext` type with three decryption handles as a `Pod`
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 #[derive(Clone, Copy, bytemuck_derive::Pod, bytemuck_derive::Zeroable, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct PodGroupedElGamalCiphertext3Handles(
@@ -114,6 +144,23 @@ impl Default for PodGroupedElGamalCiphertext3Handles {
         Self::zeroed()
     }
 }
+
+impl fmt::Display for PodGroupedElGamalCiphertext3Handles {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", BASE64_STANDARD.encode(self.0))
+    }
+}
+
+impl_from_str!(
+    TYPE = PodGroupedElGamalCiphertext3Handles,
+    BYTES_LEN = GROUPED_ELGAMAL_CIPHERTEXT_3_HANDLES,
+    BASE64_LEN = GROUPED_ELGAMAL_CIPHERTEXT_3_HANDLES_MAX_BASE64_LEN
+);
+
+impl_from_bytes!(
+    TYPE = PodGroupedElGamalCiphertext3Handles,
+    BYTES_LEN = GROUPED_ELGAMAL_CIPHERTEXT_3_HANDLES
+);
 
 #[cfg(not(target_os = "solana"))]
 impl From<GroupedElGamalCiphertext<3>> for PodGroupedElGamalCiphertext3Handles {

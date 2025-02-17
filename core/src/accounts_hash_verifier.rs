@@ -1,12 +1,13 @@
 //! Service to calculate accounts hashes
 
 use {
+    crate::snapshot_packager_service::PendingSnapshotPackages,
     crossbeam_channel::{Receiver, Sender},
     solana_accounts_db::{
         accounts_db::CalcAccountsHashKind,
         accounts_hash::{
             AccountsHash, AccountsHashKind, CalcAccountsHashConfig, HashStats,
-            IncrementalAccountsHash,
+            IncrementalAccountsHash, MerkleOrLatticeAccountsHash,
         },
         sorted_storages::SortedStorages,
     },
@@ -15,7 +16,8 @@ use {
         serde_snapshot::BankIncrementalSnapshotPersistence,
         snapshot_config::SnapshotConfig,
         snapshot_package::{
-            self, AccountsPackage, AccountsPackageKind, SnapshotKind, SnapshotPackage,
+            self, AccountsHashAlgorithm, AccountsPackage, AccountsPackageKind, SnapshotKind,
+            SnapshotPackage,
         },
         snapshot_utils,
     },
@@ -24,7 +26,7 @@ use {
         io::Result as IoResult,
         sync::{
             atomic::{AtomicBool, Ordering},
-            Arc,
+            Arc, Mutex,
         },
         thread::{self, Builder, JoinHandle},
         time::Duration,
@@ -39,7 +41,7 @@ impl AccountsHashVerifier {
     pub fn new(
         accounts_package_sender: Sender<AccountsPackage>,
         accounts_package_receiver: Receiver<AccountsPackage>,
-        snapshot_package_sender: Option<Sender<SnapshotPackage>>,
+        pending_snapshot_packages: Arc<Mutex<PendingSnapshotPackages>>,
         exit: Arc<AtomicBool>,
         snapshot_config: SnapshotConfig,
     ) -> Self {
@@ -71,12 +73,14 @@ impl AccountsHashVerifier {
 
                     let (result, handling_time_us) = measure_us!(Self::process_accounts_package(
                         accounts_package,
-                        snapshot_package_sender.as_ref(),
+                        &pending_snapshot_packages,
                         &snapshot_config,
-                        &exit,
                     ));
                     if let Err(err) = result {
-                        error!("Stopping AccountsHashVerifier! Fatal error while processing accounts package: {err}");
+                        error!(
+                            "Stopping AccountsHashVerifier! Fatal error while processing accounts \
+                             package: {err}"
+                        );
                         exit.store(true, Ordering::Relaxed);
                         break;
                     }
@@ -144,7 +148,8 @@ impl AccountsHashVerifier {
                     .count();
                 assert!(
                     num_eah_packages <= 1,
-                    "Only a single EAH accounts package is allowed at a time! count: {num_eah_packages}"
+                    "Only a single EAH accounts package is allowed at a time! count: \
+                     {num_eah_packages}"
                 );
 
                 // Get the two highest priority requests, `y` and `z`.
@@ -208,24 +213,22 @@ impl AccountsHashVerifier {
     #[allow(clippy::too_many_arguments)]
     fn process_accounts_package(
         accounts_package: AccountsPackage,
-        snapshot_package_sender: Option<&Sender<SnapshotPackage>>,
+        pending_snapshot_packages: &Mutex<PendingSnapshotPackages>,
         snapshot_config: &SnapshotConfig,
-        exit: &AtomicBool,
     ) -> IoResult<()> {
-        let (accounts_hash_kind, bank_incremental_snapshot_persistence) =
+        let (merkle_or_lattice_accounts_hash, bank_incremental_snapshot_persistence) =
             Self::calculate_and_verify_accounts_hash(&accounts_package, snapshot_config)?;
 
-        Self::save_epoch_accounts_hash(&accounts_package, accounts_hash_kind);
+        Self::save_epoch_accounts_hash(&accounts_package, &merkle_or_lattice_accounts_hash);
 
         Self::purge_old_accounts_hashes(&accounts_package, snapshot_config);
 
         Self::submit_for_packaging(
             accounts_package,
-            snapshot_package_sender,
+            pending_snapshot_packages,
             snapshot_config,
-            accounts_hash_kind,
+            merkle_or_lattice_accounts_hash,
             bank_incremental_snapshot_persistence,
-            exit,
         );
 
         Ok(())
@@ -235,7 +238,26 @@ impl AccountsHashVerifier {
     fn calculate_and_verify_accounts_hash(
         accounts_package: &AccountsPackage,
         snapshot_config: &SnapshotConfig,
-    ) -> IoResult<(AccountsHashKind, Option<BankIncrementalSnapshotPersistence>)> {
+    ) -> IoResult<(
+        MerkleOrLatticeAccountsHash,
+        Option<BankIncrementalSnapshotPersistence>,
+    )> {
+        match accounts_package.accounts_hash_algorithm {
+            AccountsHashAlgorithm::Merkle => {
+                debug!(
+                    "calculate_and_verify_accounts_hash(): snapshots lt hash is disabled, \
+                     DO merkle-based accounts hash calculation",
+                );
+            }
+            AccountsHashAlgorithm::Lattice => {
+                debug!(
+                    "calculate_and_verify_accounts_hash(): snapshots lt hash is enabled, \
+                     SKIP merkle-based accounts hash calculation",
+                );
+                return Ok((MerkleOrLatticeAccountsHash::Lattice, None));
+            }
+        }
+
         let accounts_hash_calculation_kind = match accounts_package.package_kind {
             AccountsPackageKind::AccountsHashVerifier => CalcAccountsHashKind::Full,
             AccountsPackageKind::EpochAccountsHash => CalcAccountsHashKind::Full,
@@ -263,12 +285,12 @@ impl AccountsHashVerifier {
                         accounts_db.get_accounts_hash(base_slot)
                     else {
                         panic!(
-                            "incremental snapshot requires accounts hash and capitalization \
-                             from the full snapshot it is based on \n\
-                             package: {accounts_package:?} \n\
-                             accounts hashes: {:?} \n\
-                             incremental accounts hashes: {:?} \n\
-                             full snapshot archives: {:?} \n\
+                            "incremental snapshot requires accounts hash and capitalization from \
+                             the full snapshot it is based on\n\
+                             package: {accounts_package:?}\n\
+                             accounts hashes: {:?}\n\
+                             incremental accounts hashes: {:?}\n\
+                             full snapshot archives: {:?}\n\
                              bank snapshots: {:?}",
                             accounts_db.get_accounts_hashes(),
                             accounts_db.get_incremental_accounts_hashes(),
@@ -295,7 +317,10 @@ impl AccountsHashVerifier {
                 }
             };
 
-        Ok((accounts_hash_kind, bank_incremental_snapshot_persistence))
+        Ok((
+            MerkleOrLatticeAccountsHash::Merkle(accounts_hash_kind),
+            bank_incremental_snapshot_persistence,
+        ))
     }
 
     fn _calculate_full_accounts_hash(
@@ -346,10 +371,9 @@ impl AccountsHashVerifier {
                     HashStats::default(),
                 );
             panic!(
-                "accounts hash capitalization mismatch: expected {}, but calculated {} (then recalculated {})",
-                accounts_package.expected_capitalization,
-                lamports,
-                second_accounts_hash.1,
+                "accounts hash capitalization mismatch: expected {}, but calculated {} (then \
+                 recalculated {})",
+                accounts_package.expected_capitalization, lamports, second_accounts_hash.1,
             );
         }
 
@@ -411,11 +435,13 @@ impl AccountsHashVerifier {
 
     fn save_epoch_accounts_hash(
         accounts_package: &AccountsPackage,
-        accounts_hash: AccountsHashKind,
+        merkle_or_lattice_accounts_hash: &MerkleOrLatticeAccountsHash,
     ) {
         if accounts_package.package_kind == AccountsPackageKind::EpochAccountsHash {
-            let AccountsHashKind::Full(accounts_hash) = accounts_hash else {
-                panic!("EAH requires a full accounts hash!");
+            let MerkleOrLatticeAccountsHash::Merkle(AccountsHashKind::Full(accounts_hash)) =
+                merkle_or_lattice_accounts_hash
+            else {
+                panic!("EAH requires a full accounts hash, but was given {merkle_or_lattice_accounts_hash:?}");
             };
             info!(
                 "saving epoch accounts hash, slot: {}, hash: {}",
@@ -425,7 +451,7 @@ impl AccountsHashVerifier {
                 .accounts
                 .accounts_db
                 .epoch_accounts_hash_manager
-                .set_valid(accounts_hash.into(), accounts_package.slot);
+                .set_valid((*accounts_hash).into(), accounts_package.slot);
         }
     }
 
@@ -462,11 +488,10 @@ impl AccountsHashVerifier {
 
     fn submit_for_packaging(
         accounts_package: AccountsPackage,
-        snapshot_package_sender: Option<&Sender<SnapshotPackage>>,
+        pending_snapshot_packages: &Mutex<PendingSnapshotPackages>,
         snapshot_config: &SnapshotConfig,
-        accounts_hash_kind: AccountsHashKind,
+        merkle_or_lattice_accounts_hash: MerkleOrLatticeAccountsHash,
         bank_incremental_snapshot_persistence: Option<BankIncrementalSnapshotPersistence>,
-        exit: &AtomicBool,
     ) {
         if !snapshot_config.should_generate_snapshots()
             || !matches!(
@@ -476,24 +501,16 @@ impl AccountsHashVerifier {
         {
             return;
         }
-        let Some(snapshot_package_sender) = snapshot_package_sender else {
-            return;
-        };
 
         let snapshot_package = SnapshotPackage::new(
             accounts_package,
-            accounts_hash_kind,
+            merkle_or_lattice_accounts_hash,
             bank_incremental_snapshot_persistence,
         );
-        let send_result = snapshot_package_sender.send(snapshot_package);
-        if let Err(err) = send_result {
-            // Sending the snapshot package should never fail *unless* we're shutting down.
-            let snapshot_package = &err.0;
-            assert!(
-                exit.load(Ordering::Relaxed),
-                "Failed to send snapshot package: {err}, {snapshot_package:?}"
-            );
-        }
+        pending_snapshot_packages
+            .lock()
+            .unwrap()
+            .push(snapshot_package);
     }
 
     pub fn join(self) -> thread::Result<()> {

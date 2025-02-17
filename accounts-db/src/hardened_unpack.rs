@@ -2,7 +2,7 @@ use {
     bzip2::bufread::BzDecoder,
     log::*,
     rand::{thread_rng, Rng},
-    solana_sdk::genesis_config::{GenesisConfig, DEFAULT_GENESIS_ARCHIVE, DEFAULT_GENESIS_FILE},
+    solana_genesis_config::{GenesisConfig, DEFAULT_GENESIS_ARCHIVE, DEFAULT_GENESIS_FILE},
     std::{
         collections::HashMap,
         fs::{self, File},
@@ -339,7 +339,13 @@ pub fn streaming_unpack_snapshot<A: Read>(
         |_, _| {},
         |entry_path_buf| {
             if entry_path_buf.is_file() {
-                sender.send(entry_path_buf).unwrap();
+                let result = sender.send(entry_path_buf);
+                if let Err(err) = result {
+                    panic!(
+                        "failed to send path '{}' from unpacker to rebuilder: {err}",
+                        err.0.display(),
+                    );
+                }
             }
         },
     )
@@ -369,13 +375,10 @@ where
         |parts, kind| {
             if is_valid_snapshot_archive_entry(parts, kind) {
                 i += 1;
-                match &parallel_selector {
-                    Some(parallel_selector) => {
-                        if !parallel_selector.select_index(i - 1) {
-                            return UnpackPath::Ignore;
-                        }
+                if let Some(parallel_selector) = &parallel_selector {
+                    if !parallel_selector.select_index(i - 1) {
+                        return UnpackPath::Ignore;
                     }
-                    None => {}
                 };
                 if let ["accounts", file] = parts {
                     // Randomly distribute the accounts files about the available `account_paths`,

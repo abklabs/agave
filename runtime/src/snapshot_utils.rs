@@ -1,6 +1,6 @@
 use {
     crate::{
-        bank::{BankFieldsToSerialize, BankSlotDelta},
+        bank::{BankFieldsToSerialize, BankHashStats, BankSlotDelta},
         serde_snapshot::{
             self, BankIncrementalSnapshotPersistence, ExtraFieldsToSerialize, SnapshotStreams,
         },
@@ -24,7 +24,7 @@ use {
     regex::Regex,
     solana_accounts_db::{
         account_storage::{meta::StoredMetaWriteVersion, AccountStorageMap},
-        accounts_db::{AccountStorageEntry, AtomicAccountsFileId, BankHashStats},
+        accounts_db::{AccountStorageEntry, AtomicAccountsFileId},
         accounts_file::{AccountsFile, AccountsFileError, InternalsForArchive, StorageAccess},
         accounts_hash::{AccountsDeltaHash, AccountsHash},
         epoch_accounts_hash::EpochAccountsHash,
@@ -114,7 +114,7 @@ impl FromStr for SnapshotVersion {
         // Remove leading 'v' or 'V' from slice
         let version_string = if version_string
             .get(..1)
-            .map_or(false, |s| s.eq_ignore_ascii_case("v"))
+            .is_some_and(|s| s.eq_ignore_ascii_case("v"))
         {
             &version_string[1..]
         } else {
@@ -339,8 +339,11 @@ pub enum SnapshotError {
     #[error("no snapshot archives to load from '{0}'")]
     NoSnapshotArchives(PathBuf),
 
-    #[error("snapshot has mismatch: deserialized bank: {0:?}, snapshot archive info: {1:?}")]
-    MismatchedSlotHash((Slot, SnapshotHash), (Slot, SnapshotHash)),
+    #[error("snapshot slot mismatch: deserialized bank: {0}, snapshot archive: {1}")]
+    MismatchedSlot(Slot, Slot),
+
+    #[error("snapshot hash mismatch: deserialized bank: {0:?}, snapshot archive: {1:?}")]
+    MismatchedHash(SnapshotHash, SnapshotHash),
 
     #[error("snapshot slot deltas are invalid: {0}")]
     VerifySlotDeltas(#[from] VerifySlotDeltasError),
@@ -884,6 +887,7 @@ fn serialize_snapshot(
                 incremental_snapshot_persistence: bank_incremental_snapshot_persistence,
                 epoch_accounts_hash,
                 versioned_epoch_stakes,
+                accounts_lt_hash: bank_fields.accounts_lt_hash.clone().map(Into::into),
             };
             serde_snapshot::serialize_bank_snapshot_into(
                 stream,
@@ -1082,9 +1086,10 @@ fn archive_snapshot(
                 do_archive_files(&mut encoder)?;
                 encoder.finish().map_err(E::FinishEncoder)?;
             }
-            ArchiveFormat::TarZstd => {
+            ArchiveFormat::TarZstd { config } => {
                 let mut encoder =
-                    zstd::stream::Encoder::new(archive_file, 0).map_err(E::CreateEncoder)?;
+                    zstd::stream::Encoder::new(archive_file, config.compression_level)
+                        .map_err(E::CreateEncoder)?;
                 do_archive_files(&mut encoder)?;
                 encoder.finish().map_err(E::FinishEncoder)?;
             }
@@ -2265,7 +2270,7 @@ fn untar_snapshot_create_shared_buffer(
     match archive_format {
         ArchiveFormat::TarBzip2 => SharedBuffer::new(BzDecoder::new(BufReader::new(open_file()))),
         ArchiveFormat::TarGzip => SharedBuffer::new(GzDecoder::new(BufReader::new(open_file()))),
-        ArchiveFormat::TarZstd => SharedBuffer::new(
+        ArchiveFormat::TarZstd { .. } => SharedBuffer::new(
             zstd::stream::read::Decoder::new(BufReader::new(open_file())).unwrap(),
         ),
         ArchiveFormat::TarLz4 => {
@@ -2733,7 +2738,13 @@ mod tests {
                 Hash::default()
             ))
             .unwrap(),
-            (43, SnapshotHash(Hash::default()), ArchiveFormat::TarZstd)
+            (
+                43,
+                SnapshotHash(Hash::default()),
+                ArchiveFormat::TarZstd {
+                    config: ZstdConfig::default(),
+                }
+            )
         );
         assert_eq!(
             parse_full_snapshot_archive_filename(&format!("snapshot-44-{}.tar", Hash::default()))
@@ -2814,7 +2825,9 @@ mod tests {
                 43,
                 234,
                 SnapshotHash(Hash::default()),
-                ArchiveFormat::TarZstd
+                ArchiveFormat::TarZstd {
+                    config: ZstdConfig::default(),
+                }
             )
         );
         assert_eq!(

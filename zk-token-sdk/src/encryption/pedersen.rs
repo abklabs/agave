@@ -99,7 +99,9 @@ impl PedersenOpening {
 
     pub fn from_bytes(bytes: &[u8]) -> Option<PedersenOpening> {
         match bytes.try_into() {
-            Ok(bytes) => Scalar::from_canonical_bytes(bytes).map(PedersenOpening),
+            Ok(bytes) => Scalar::from_canonical_bytes(bytes)
+                .map(PedersenOpening)
+                .into(),
             _ => None,
         }
     }
@@ -116,7 +118,7 @@ impl ConstantTimeEq for PedersenOpening {
     }
 }
 
-impl<'a, 'b> Add<&'b PedersenOpening> for &'a PedersenOpening {
+impl<'b> Add<&'b PedersenOpening> for &PedersenOpening {
     type Output = PedersenOpening;
 
     fn add(self, opening: &'b PedersenOpening) -> PedersenOpening {
@@ -130,7 +132,7 @@ define_add_variants!(
     Output = PedersenOpening
 );
 
-impl<'a, 'b> Sub<&'b PedersenOpening> for &'a PedersenOpening {
+impl<'b> Sub<&'b PedersenOpening> for &PedersenOpening {
     type Output = PedersenOpening;
 
     fn sub(self, opening: &'b PedersenOpening) -> PedersenOpening {
@@ -144,7 +146,7 @@ define_sub_variants!(
     Output = PedersenOpening
 );
 
-impl<'a, 'b> Mul<&'b Scalar> for &'a PedersenOpening {
+impl<'b> Mul<&'b Scalar> for &PedersenOpening {
     type Output = PedersenOpening;
 
     fn mul(self, scalar: &'b Scalar) -> PedersenOpening {
@@ -158,7 +160,7 @@ define_mul_variants!(
     Output = PedersenOpening
 );
 
-impl<'a, 'b> Mul<&'b PedersenOpening> for &'a Scalar {
+impl<'b> Mul<&'b PedersenOpening> for &Scalar {
     type Output = PedersenOpening;
 
     fn mul(self, opening: &'b PedersenOpening) -> PedersenOpening {
@@ -192,14 +194,15 @@ impl PedersenCommitment {
         if bytes.len() != PEDERSEN_COMMITMENT_LEN {
             return None;
         }
+        let Ok(compressed_ristretto) = CompressedRistretto::from_slice(bytes) else {
+            return None;
+        };
 
-        Some(PedersenCommitment(
-            CompressedRistretto::from_slice(bytes).decompress()?,
-        ))
+        compressed_ristretto.decompress().map(PedersenCommitment)
     }
 }
 
-impl<'a, 'b> Add<&'b PedersenCommitment> for &'a PedersenCommitment {
+impl<'b> Add<&'b PedersenCommitment> for &PedersenCommitment {
     type Output = PedersenCommitment;
 
     fn add(self, commitment: &'b PedersenCommitment) -> PedersenCommitment {
@@ -213,7 +216,7 @@ define_add_variants!(
     Output = PedersenCommitment
 );
 
-impl<'a, 'b> Sub<&'b PedersenCommitment> for &'a PedersenCommitment {
+impl<'b> Sub<&'b PedersenCommitment> for &PedersenCommitment {
     type Output = PedersenCommitment;
 
     fn sub(self, commitment: &'b PedersenCommitment) -> PedersenCommitment {
@@ -227,7 +230,7 @@ define_sub_variants!(
     Output = PedersenCommitment
 );
 
-impl<'a, 'b> Mul<&'b Scalar> for &'a PedersenCommitment {
+impl<'b> Mul<&'b Scalar> for &PedersenCommitment {
     type Output = PedersenCommitment;
 
     fn mul(self, scalar: &'b Scalar) -> PedersenCommitment {
@@ -241,7 +244,7 @@ define_mul_variants!(
     Output = PedersenCommitment
 );
 
-impl<'a, 'b> Mul<&'b PedersenCommitment> for &'a Scalar {
+impl<'b> Mul<&'b PedersenCommitment> for &Scalar {
     type Output = PedersenCommitment;
 
     fn mul(self, commitment: &'b PedersenCommitment) -> PedersenCommitment {

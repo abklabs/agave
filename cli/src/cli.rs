@@ -13,7 +13,15 @@ use {
         display::println_name_value, CliSignature, CliValidatorsSortOrder, OutputFormat,
     },
     solana_client::connection_cache::ConnectionCache,
+    solana_clock::{Epoch, Slot},
+    solana_commitment_config::CommitmentConfig,
     solana_decode_error::DecodeError,
+    solana_hash::Hash,
+    solana_instruction::error::InstructionError,
+    solana_keypair::{read_keypair_file, Keypair},
+    solana_offchain_message::OffchainMessage,
+    solana_program::stake::{instruction::LockupArgs, state::Lockup},
+    solana_pubkey::Pubkey,
     solana_remote_wallet::remote_wallet::RemoteWalletManager,
     solana_rpc_client::rpc_client::RpcClient,
     solana_rpc_client_api::{
@@ -21,22 +29,14 @@ use {
         config::{RpcLargestAccountsFilter, RpcSendTransactionConfig, RpcTransactionLogsFilter},
     },
     solana_rpc_client_nonce_utils::blockhash_query::BlockhashQuery,
-    solana_sdk::{
-        clock::{Epoch, Slot},
-        commitment_config::CommitmentConfig,
-        hash::Hash,
-        instruction::InstructionError,
-        offchain_message::OffchainMessage,
-        pubkey::Pubkey,
-        signature::{Signature, Signer, SignerError},
-        signer::keypair::{read_keypair_file, Keypair},
-        stake::{instruction::LockupArgs, state::Lockup},
-        transaction::{TransactionError, VersionedTransaction},
-    },
+    solana_signature::Signature,
+    solana_signer::{Signer, SignerError},
     solana_tps_client::{utils::create_connection_cache, TpsClient},
     solana_tpu_client::tpu_client::{
         TpuClient, TpuClientConfig, DEFAULT_TPU_CONNECTION_POOL_SIZE, DEFAULT_TPU_ENABLE_UDP,
     },
+    solana_transaction::versioned::VersionedTransaction,
+    solana_transaction_error::TransactionError,
     solana_vote_program::vote_state::VoteAuthorize,
     std::{
         collections::HashMap, error, io::stdout, process::exit, rc::Rc, str::FromStr, sync::Arc,
@@ -269,6 +269,7 @@ pub enum CliCommand {
         use_lamports_unit: bool,
         with_rewards: Option<usize>,
         use_csv: bool,
+        starting_epoch: Option<u64>,
     },
     StakeAuthorize {
         stake_account_pubkey: Pubkey,
@@ -344,6 +345,7 @@ pub enum CliCommand {
         use_lamports_unit: bool,
         use_csv: bool,
         with_rewards: Option<usize>,
+        starting_epoch: Option<u64>,
     },
     WithdrawFromVoteAccount {
         vote_account_pubkey: Pubkey,
@@ -1325,6 +1327,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             use_lamports_unit,
             with_rewards,
             use_csv,
+            starting_epoch,
         } => process_show_stake_account(
             &rpc_client,
             config,
@@ -1332,6 +1335,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             *use_lamports_unit,
             *with_rewards,
             *use_csv,
+            *starting_epoch,
         ),
         CliCommand::ShowStakeHistory {
             use_lamports_unit,
@@ -1494,6 +1498,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             use_lamports_unit,
             use_csv,
             with_rewards,
+            starting_epoch,
         } => process_show_vote_account(
             &rpc_client,
             config,
@@ -1501,6 +1506,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             *use_lamports_unit,
             *use_csv,
             *with_rewards,
+            *starting_epoch,
         ),
         CliCommand::WithdrawFromVoteAccount {
             vote_account_pubkey,
@@ -1783,20 +1789,17 @@ mod tests {
     use {
         super::*,
         serde_json::json,
+        solana_keypair::{keypair_from_seed, read_keypair_file, write_keypair_file, Keypair},
+        solana_presigner::Presigner,
+        solana_pubkey::Pubkey,
         solana_rpc_client::mock_sender_for_cli::SIGNATURE,
         solana_rpc_client_api::{
             request::RpcRequest,
             response::{Response, RpcResponseContext},
         },
         solana_rpc_client_nonce_utils::blockhash_query,
-        solana_sdk::{
-            pubkey::Pubkey,
-            signature::{
-                keypair_from_seed, read_keypair_file, write_keypair_file, Keypair, Presigner,
-            },
-            stake, system_program,
-            transaction::TransactionError,
-        },
+        solana_sdk_ids::{stake, system_program},
+        solana_transaction_error::TransactionError,
         solana_transaction_status::TransactionConfirmationStatus,
     };
 
@@ -1834,10 +1837,7 @@ mod tests {
             .unwrap();
         assert_eq!(signer_info.signers.len(), 1);
         assert_eq!(signer_info.index_of(None), Some(0));
-        assert_eq!(
-            signer_info.index_of(Some(solana_sdk::pubkey::new_rand())),
-            None
-        );
+        assert_eq!(signer_info.index_of(Some(solana_pubkey::new_rand())), None);
 
         let keypair0 = keypair_from_seed(&[1u8; 32]).unwrap();
         let keypair0_pubkey = keypair0.pubkey();
@@ -1898,7 +1898,7 @@ mod tests {
     fn test_cli_parse_command() {
         let test_commands = get_clap_app("test", "desc", "version");
 
-        let pubkey = solana_sdk::pubkey::new_rand();
+        let pubkey = solana_pubkey::new_rand();
         let pubkey_string = format!("{pubkey}");
 
         let default_keypair = Keypair::new();
@@ -1977,11 +1977,11 @@ mod tests {
         assert!(parse_command(&test_bad_signature, &default_signer, &mut None).is_err());
 
         // Test CreateAddressWithSeed
-        let from_pubkey = solana_sdk::pubkey::new_rand();
+        let from_pubkey = solana_pubkey::new_rand();
         let from_str = from_pubkey.to_string();
         for (name, program_id) in &[
-            ("STAKE", stake::program::id()),
-            ("VOTE", solana_vote_program::id()),
+            ("STAKE", stake::id()),
+            ("VOTE", solana_sdk_ids::vote::id()),
             ("NONCE", system_program::id()),
         ] {
             let test_create_address_with_seed = test_commands.clone().get_matches_from(vec![
@@ -2013,7 +2013,7 @@ mod tests {
                 command: CliCommand::CreateAddressWithSeed {
                     from_pubkey: None,
                     seed: "seed".to_string(),
-                    program_id: stake::program::id(),
+                    program_id: stake::id(),
                 },
                 signers: vec![Box::new(read_keypair_file(&keypair_file).unwrap())],
             }
@@ -2160,7 +2160,7 @@ mod tests {
             ..CliConfig::default()
         };
         let current_authority = keypair_from_seed(&[5; 32]).unwrap();
-        let new_authorized_pubkey = solana_sdk::pubkey::new_rand();
+        let new_authorized_pubkey = solana_pubkey::new_rand();
         vote_config.signers = vec![&current_authority];
         vote_config.command = CliCommand::VoteAuthorize {
             vote_account_pubkey: bob_pubkey,
@@ -2200,7 +2200,7 @@ mod tests {
 
         let bob_keypair = Keypair::new();
         let bob_pubkey = bob_keypair.pubkey();
-        let custodian = solana_sdk::pubkey::new_rand();
+        let custodian = solana_pubkey::new_rand();
         config.command = CliCommand::CreateStakeAccount {
             stake_account: 1,
             seed: None,
@@ -2227,8 +2227,8 @@ mod tests {
         let result = process_command(&config);
         assert!(result.is_ok());
 
-        let stake_account_pubkey = solana_sdk::pubkey::new_rand();
-        let to_pubkey = solana_sdk::pubkey::new_rand();
+        let stake_account_pubkey = solana_pubkey::new_rand();
+        let to_pubkey = solana_pubkey::new_rand();
         config.command = CliCommand::WithdrawStake {
             stake_account_pubkey,
             destination_account_pubkey: to_pubkey,
@@ -2249,7 +2249,7 @@ mod tests {
         let result = process_command(&config);
         assert!(result.is_ok());
 
-        let stake_account_pubkey = solana_sdk::pubkey::new_rand();
+        let stake_account_pubkey = solana_pubkey::new_rand();
         config.command = CliCommand::DeactivateStake {
             stake_account_pubkey,
             stake_authority: 0,
@@ -2267,7 +2267,7 @@ mod tests {
         let result = process_command(&config);
         assert!(result.is_ok());
 
-        let stake_account_pubkey = solana_sdk::pubkey::new_rand();
+        let stake_account_pubkey = solana_pubkey::new_rand();
         let split_stake_account = Keypair::new();
         config.command = CliCommand::SplitStake {
             stake_account_pubkey,
@@ -2289,8 +2289,8 @@ mod tests {
         let result = process_command(&config);
         assert!(result.is_ok());
 
-        let stake_account_pubkey = solana_sdk::pubkey::new_rand();
-        let source_stake_account_pubkey = solana_sdk::pubkey::new_rand();
+        let stake_account_pubkey = solana_pubkey::new_rand();
+        let source_stake_account_pubkey = solana_pubkey::new_rand();
         let merge_stake_account = Keypair::new();
         config.command = CliCommand::MergeStake {
             stake_account_pubkey,
@@ -2316,20 +2316,20 @@ mod tests {
         assert_eq!(process_command(&config).unwrap(), "1234");
 
         // CreateAddressWithSeed
-        let from_pubkey = solana_sdk::pubkey::new_rand();
+        let from_pubkey = solana_pubkey::new_rand();
         config.signers = vec![];
         config.command = CliCommand::CreateAddressWithSeed {
             from_pubkey: Some(from_pubkey),
             seed: "seed".to_string(),
-            program_id: stake::program::id(),
+            program_id: stake::id(),
         };
         let address = process_command(&config);
         let expected_address =
-            Pubkey::create_with_seed(&from_pubkey, "seed", &stake::program::id()).unwrap();
+            Pubkey::create_with_seed(&from_pubkey, "seed", &stake::id()).unwrap();
         assert_eq!(address.unwrap(), expected_address.to_string());
 
         // Need airdrop cases
-        let to = solana_sdk::pubkey::new_rand();
+        let to = solana_pubkey::new_rand();
         config.signers = vec![&keypair];
         config.command = CliCommand::Airdrop {
             pubkey: Some(to),
@@ -2557,7 +2557,7 @@ mod tests {
         );
 
         //Test Transfer Subcommand, offline sign
-        let blockhash = Hash::new(&[1u8; 32]);
+        let blockhash = Hash::new_from_array([1u8; 32]);
         let blockhash_string = blockhash.to_string();
         let test_transfer = test_commands.clone().get_matches_from(vec![
             "test",
@@ -2714,11 +2714,32 @@ mod tests {
                     memo: None,
                     fee_payer: 0,
                     derived_address_seed: Some(derived_address_seed),
-                    derived_address_program_id: Some(stake::program::id()),
+                    derived_address_program_id: Some(stake::id()),
                     compute_unit_price: None,
                 },
                 signers: vec![Box::new(read_keypair_file(&default_keypair_file).unwrap()),],
             }
         );
+    }
+
+    #[test]
+    fn test_cli_completions() {
+        let mut clap_app = get_clap_app("test", "desc", "version");
+
+        let shells = [
+            Shell::Bash,
+            Shell::Fish,
+            Shell::Zsh,
+            Shell::PowerShell,
+            Shell::Elvish,
+        ];
+
+        for shell in shells {
+            let mut buf: Vec<u8> = vec![];
+
+            clap_app.gen_completions_to("solana", shell, &mut buf);
+
+            assert!(!buf.is_empty());
+        }
     }
 }

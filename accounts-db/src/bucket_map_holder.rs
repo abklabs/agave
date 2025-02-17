@@ -8,11 +8,9 @@ use {
         waitable_condvar::WaitableCondvar,
     },
     solana_bucket_map::bucket_map::{BucketMap, BucketMapConfig},
+    solana_clock::{Slot, DEFAULT_MS_PER_SLOT},
     solana_measure::measure::Measure,
-    solana_sdk::{
-        clock::{Slot, DEFAULT_MS_PER_SLOT},
-        timing::AtomicInterval,
-    },
+    solana_time_utils::AtomicInterval,
     std::{
         fmt::Debug,
         marker::PhantomData,
@@ -28,9 +26,6 @@ pub type AtomicAge = AtomicU8;
 const _: () = assert!(std::mem::size_of::<Age>() == std::mem::size_of::<AtomicAge>());
 
 const AGE_MS: u64 = DEFAULT_MS_PER_SLOT; // match one age per slot time
-
-// 10 GB limit for in-mem idx. In practice, we don't get this high. This tunes how aggressively to save items we expect to use soon.
-pub const DEFAULT_DISK_INDEX: Option<usize> = Some(10_000);
 
 pub struct BucketMapHolder<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> {
     pub disk: Option<BucketMap<(Slot, U)>>,
@@ -58,10 +53,6 @@ pub struct BucketMapHolder<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>>
     bins: usize,
 
     pub threads: usize,
-
-    // how much mb are we allowed to keep in the in-mem index?
-    // Rest goes to disk.
-    pub mem_budget_mb: Option<usize>,
 
     /// how many ages should elapse from the last time an item is used where the item will remain in the cache
     pub ages_to_stay_in_cache: Age,
@@ -141,7 +132,7 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> BucketMapHolder<T, U>
     /// return when the bg threads have reached an 'idle' state
     pub fn wait_for_idle(&self) {
         assert!(self.get_startup());
-        if self.disk.is_none() {
+        if !self.is_disk_index_enabled() {
             return;
         }
 
@@ -217,43 +208,15 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> BucketMapHolder<T, U>
             config.drives.clone()
         });
 
-        let mem_budget_mb = match config
+        let disk = match config
             .as_ref()
-            .map(|config| &config.index_limit_mb)
-            .unwrap_or(&IndexLimitMb::Unspecified)
+            .map(|config| config.index_limit_mb)
+            .unwrap_or_default()
         {
-            // creator said to use disk idx with a specific limit
-            IndexLimitMb::Limit(mb) => Some(*mb),
-            // creator said InMemOnly, so no disk index
             IndexLimitMb::InMemOnly => None,
-            // whatever started us didn't specify whether to use the acct idx
-            IndexLimitMb::Unspecified => {
-                // check env var if we were not started from a validator
-                let mut use_default = true;
-                if !config
-                    .as_ref()
-                    .map(|config| config.started_from_validator)
-                    .unwrap_or_default()
-                {
-                    if let Ok(_limit) = std::env::var("SOLANA_TEST_ACCOUNTS_INDEX_MEMORY_LIMIT_MB")
-                    {
-                        // Note this env var means the opposite of the default. The default now is disk index is on.
-                        // So, if this env var is set, DO NOT allocate with disk buckets if mem budget was not set, we were NOT started from validator, and env var was set
-                        // we do not want the env var to have an effect when running the validator (only tests, benches, etc.)
-                        use_default = false;
-                    }
-                }
-                if use_default {
-                    // if validator does not specify disk index limit or specify in mem only, then this is the default
-                    DEFAULT_DISK_INDEX
-                } else {
-                    None
-                }
-            }
+            IndexLimitMb::Unlimited => Some(BucketMap::new(bucket_config)),
         };
 
-        // only allocate if mem_budget_mb is Some
-        let disk = mem_budget_mb.map(|_| BucketMap::new(bucket_config));
         Self {
             disk,
             ages_to_stay_in_cache,
@@ -270,7 +233,7 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> BucketMapHolder<T, U>
             age_timer: AtomicInterval::default(),
             bins,
             startup: AtomicBool::default(),
-            mem_budget_mb,
+
             threads,
             _phantom: PhantomData,
             startup_stats: Arc::default(),
@@ -350,13 +313,18 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> BucketMapHolder<T, U>
         can_advance_age: bool,
     ) {
         let bins = in_mem.len();
-        let flush = self.disk.is_some();
+        let flush = self.is_disk_index_enabled();
         let mut throttling_wait_ms = None;
         loop {
             if !flush {
+                let mut m = Measure::start("wait");
                 self.wait_dirty_or_aged.wait_timeout(Duration::from_millis(
                     self.stats.remaining_until_next_interval(),
                 ));
+                m.stop();
+                self.stats
+                    .bg_waiting_us
+                    .fetch_add(m.as_us(), Ordering::Relaxed);
             } else if self.should_thread_sleep() || throttling_wait_ms.is_some() {
                 let mut wait = std::cmp::min(
                     self.age_timer
@@ -512,10 +480,7 @@ pub mod tests {
     #[test]
     fn test_disk_index_enabled() {
         let bins = 1;
-        let config = AccountsIndexConfig {
-            index_limit_mb: IndexLimitMb::Limit(0),
-            ..AccountsIndexConfig::default()
-        };
+        let config = AccountsIndexConfig::default();
         let test = BucketMapHolder::<u64, u64>::new(bins, &Some(config), 1);
         assert!(test.is_disk_index_enabled());
     }

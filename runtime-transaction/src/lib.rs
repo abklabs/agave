@@ -1,6 +1,6 @@
-#![cfg_attr(RUSTC_WITH_SPECIALIZATION, feature(min_specialization))]
 #![allow(clippy::arithmetic_side_effects)]
 
-pub mod instructions_processor;
 pub mod runtime_transaction;
+pub mod signature_details;
 pub mod transaction_meta;
+pub mod transaction_with_meta;

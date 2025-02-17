@@ -20,13 +20,11 @@ use {
     },
     log::*,
     memmap2::MmapMut,
-    solana_sdk::{
-        account::{AccountSharedData, ReadableAccount, WritableAccount},
-        hash::Hash,
-        pubkey::Pubkey,
-        stake_history::Epoch,
-        system_instruction::MAX_PERMITTED_DATA_LENGTH,
-    },
+    solana_account::{AccountSharedData, ReadableAccount, WritableAccount},
+    solana_clock::Epoch,
+    solana_hash::Hash,
+    solana_pubkey::Pubkey,
+    solana_system_interface::MAX_PERMITTED_DATA_LENGTH,
     std::{
         convert::TryFrom,
         fs::{remove_file, File, OpenOptions},
@@ -44,7 +42,7 @@ use {
 
 pub mod test_utils;
 #[cfg(test)]
-use solana_sdk::account::accounts_equal;
+use solana_account::accounts_equal;
 
 /// size of the fixed sized fields in an append vec
 /// we need to add data len and align it to get the actual stored size
@@ -294,23 +292,37 @@ const fn page_align(size: u64) -> u64 {
 #[cfg_attr(feature = "dev-context-only-utils", qualifier_attr::qualifiers(pub))]
 const SCAN_BUFFER_SIZE_WITHOUT_DATA: usize = 1 << 16;
 
+pub struct AppendVecStat {
+    pub mmap_files_open: AtomicU64,
+    pub mmap_files_dirty: AtomicU64,
+    pub open_as_file_io: AtomicU64,
+}
+
 lazy_static! {
-    pub static ref APPEND_VEC_MMAPPED_FILES_OPEN: AtomicU64 = AtomicU64::default();
-    pub static ref APPEND_VEC_MMAPPED_FILES_DIRTY: AtomicU64 = AtomicU64::default();
-    pub static ref APPEND_VEC_OPEN_AS_FILE_IO: AtomicU64 = AtomicU64::default();
+    pub static ref APPEND_VEC_STATS: AppendVecStat = AppendVecStat {
+        mmap_files_open: AtomicU64::new(0),
+        mmap_files_dirty: AtomicU64::new(0),
+        open_as_file_io: AtomicU64::new(0),
+    };
 }
 
 impl Drop for AppendVec {
     fn drop(&mut self) {
-        APPEND_VEC_MMAPPED_FILES_OPEN.fetch_sub(1, Ordering::Relaxed);
+        APPEND_VEC_STATS
+            .mmap_files_open
+            .fetch_sub(1, Ordering::Relaxed);
         match &self.backing {
             AppendVecFileBacking::Mmap(mmap_only) => {
                 if mmap_only.is_dirty.load(Ordering::Acquire) {
-                    APPEND_VEC_MMAPPED_FILES_DIRTY.fetch_sub(1, Ordering::Relaxed);
+                    APPEND_VEC_STATS
+                        .mmap_files_dirty
+                        .fetch_sub(1, Ordering::Relaxed);
                 }
             }
             AppendVecFileBacking::File(_) => {
-                APPEND_VEC_OPEN_AS_FILE_IO.fetch_sub(1, Ordering::Relaxed);
+                APPEND_VEC_STATS
+                    .open_as_file_io
+                    .fetch_sub(1, Ordering::Relaxed);
             }
         }
         if self.remove_file_on_drop.load(Ordering::Acquire) {
@@ -371,7 +383,9 @@ impl AppendVec {
             );
             std::process::exit(1);
         });
-        APPEND_VEC_MMAPPED_FILES_OPEN.fetch_add(1, Ordering::Relaxed);
+        APPEND_VEC_STATS
+            .mmap_files_open
+            .fetch_add(1, Ordering::Relaxed);
 
         AppendVec {
             path: file,
@@ -409,19 +423,27 @@ impl AppendVec {
         }
     }
 
+    pub fn dead_bytes_due_to_zero_lamport_single_ref(&self, count: usize) -> usize {
+        aligned_stored_size(0) * count
+    }
+
     pub fn flush(&self) -> Result<()> {
         match &self.backing {
             AppendVecFileBacking::Mmap(mmap_only) => {
                 // Check to see if the mmap is actually dirty before flushing.
-                if mmap_only.is_dirty.load(Ordering::Acquire) {
+                let should_flush = mmap_only.is_dirty.swap(false, Ordering::AcqRel);
+                if should_flush {
                     mmap_only.mmap.flush()?;
-                    mmap_only.is_dirty.store(false, Ordering::Release);
-                    APPEND_VEC_MMAPPED_FILES_DIRTY.fetch_sub(1, Ordering::Relaxed);
+                    APPEND_VEC_STATS
+                        .mmap_files_dirty
+                        .fetch_sub(1, Ordering::Relaxed);
                 }
                 Ok(())
             }
-            // File also means read only, so nothing to flush.
-            AppendVecFileBacking::File(_file) => Ok(()),
+            AppendVecFileBacking::File(_file) => {
+                // File also means read only, so nothing to flush.
+                Ok(())
+            }
         }
     }
 
@@ -517,8 +539,12 @@ impl AppendVec {
         #[cfg(unix)]
         // we must use mmap on non-linux
         if storage_access == StorageAccess::File {
-            APPEND_VEC_MMAPPED_FILES_OPEN.fetch_add(1, Ordering::Relaxed);
-            APPEND_VEC_OPEN_AS_FILE_IO.fetch_add(1, Ordering::Relaxed);
+            APPEND_VEC_STATS
+                .mmap_files_open
+                .fetch_add(1, Ordering::Relaxed);
+            APPEND_VEC_STATS
+                .open_as_file_io
+                .fetch_add(1, Ordering::Relaxed);
 
             return Ok(AppendVec {
                 path,
@@ -538,7 +564,9 @@ impl AppendVec {
             }
             result?
         };
-        APPEND_VEC_MMAPPED_FILES_OPEN.fetch_add(1, Ordering::Relaxed);
+        APPEND_VEC_STATS
+            .mmap_files_open
+            .fetch_add(1, Ordering::Relaxed);
 
         Ok(AppendVec {
             path,
@@ -820,7 +848,7 @@ impl AppendVec {
     pub fn get_account_test(
         &self,
         offset: usize,
-    ) -> Option<(StoredMeta, solana_sdk::account::AccountSharedData)> {
+    ) -> Option<(StoredMeta, solana_account::AccountSharedData)> {
         let sizes = self.get_account_sizes(&[offset]);
         let result = self.get_stored_account_meta_callback(offset, |r_callback| {
             let r2 = self.get_account_shared_data(offset);
@@ -1159,7 +1187,9 @@ impl AppendVec {
                     // (This also ensures the 'dirty counter' datapoint is correct.)
                     if !mmap_only.is_dirty.load(Ordering::Acquire) {
                         mmap_only.is_dirty.store(true, Ordering::Release);
-                        APPEND_VEC_MMAPPED_FILES_DIRTY.fetch_add(1, Ordering::Relaxed);
+                        APPEND_VEC_STATS
+                            .mmap_files_dirty
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
@@ -1203,11 +1233,8 @@ pub mod tests {
         assert_matches::assert_matches,
         memoffset::offset_of,
         rand::{thread_rng, Rng},
-        solana_sdk::{
-            account::{Account, AccountSharedData},
-            clock::Slot,
-            timing::duration_as_ms,
-        },
+        solana_account::{Account, AccountSharedData},
+        solana_clock::Slot,
         std::{mem::ManuallyDrop, time::Instant},
         test_case::test_case,
     };
@@ -1535,7 +1562,7 @@ pub mod tests {
             indexes.push(pos);
             assert_eq!(sizes, av.get_account_sizes(&indexes));
         }
-        trace!("append time: {} ms", duration_as_ms(&now.elapsed()),);
+        trace!("append time: {} ms", now.elapsed().as_millis());
 
         let now = Instant::now();
         for _ in 0..size {
@@ -1543,7 +1570,7 @@ pub mod tests {
             let account = create_test_account(sample + 1);
             assert_eq!(av.get_account_test(indexes[sample]).unwrap(), account);
         }
-        trace!("random read time: {} ms", duration_as_ms(&now.elapsed()),);
+        trace!("random read time: {} ms", now.elapsed().as_millis());
 
         let now = Instant::now();
         assert_eq!(indexes.len(), size);
@@ -1556,10 +1583,7 @@ pub mod tests {
             assert_eq!(recovered, account.1);
             sample += 1;
         });
-        trace!(
-            "sequential read time: {} ms",
-            duration_as_ms(&now.elapsed()),
-        );
+        trace!("sequential read time: {} ms", now.elapsed().as_millis());
     }
 
     #[test_case(StorageAccess::Mmap)]
@@ -1579,7 +1603,7 @@ pub mod tests {
             let mut av = AppendVec::new(path, true, 256);
             av.set_no_remove_on_drop();
 
-            let pubkey = solana_sdk::pubkey::new_rand();
+            let pubkey = solana_pubkey::new_rand();
             let owner = Pubkey::default();
             let data_len = 3_u64;
             let mut account = AccountSharedData::new(0, data_len as usize, &owner);
@@ -1915,7 +1939,7 @@ pub mod tests {
         check_fn: impl Fn(&AppendVec, &[Pubkey], &[usize], &[AccountSharedData]),
     ) {
         const NUM_ACCOUNTS: usize = 37;
-        let pubkeys: Vec<_> = std::iter::repeat_with(solana_sdk::pubkey::new_rand)
+        let pubkeys: Vec<_> = std::iter::repeat_with(solana_pubkey::new_rand)
             .take(NUM_ACCOUNTS)
             .collect();
 
@@ -2008,12 +2032,12 @@ pub mod tests {
             let fake_stored_meta = StoredMeta {
                 write_version_obsolete: 0,
                 data_len: 100,
-                pubkey: solana_sdk::pubkey::new_rand(),
+                pubkey: solana_pubkey::new_rand(),
             };
             let fake_account_meta = AccountMeta {
                 lamports: 100,
                 rent_epoch: 10,
-                owner: solana_sdk::pubkey::new_rand(),
+                owner: solana_pubkey::new_rand(),
                 executable: false,
             };
 
@@ -2107,12 +2131,12 @@ pub mod tests {
             let fake_stored_meta = StoredMeta {
                 write_version_obsolete: 0,
                 data_len: 100,
-                pubkey: solana_sdk::pubkey::new_rand(),
+                pubkey: solana_pubkey::new_rand(),
             };
             let fake_account_meta = AccountMeta {
                 lamports: 100,
                 rent_epoch: 10,
-                owner: solana_sdk::pubkey::new_rand(),
+                owner: solana_pubkey::new_rand(),
                 executable: false,
             };
 

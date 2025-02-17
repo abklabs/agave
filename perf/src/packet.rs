@@ -1,11 +1,12 @@
 //! The `packet` module defines data structures and methods to pull data from the network.
-pub use solana_sdk::packet::{Meta, Packet, PacketFlags, PACKET_DATA_SIZE};
+pub use solana_packet::{self, Meta, Packet, PacketFlags, PACKET_DATA_SIZE};
 use {
     crate::{cuda_runtime::PinnedVec, recycler::Recycler},
     bincode::config::Options,
     rayon::prelude::{IntoParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator},
     serde::{de::DeserializeOwned, Deserialize, Serialize},
     std::{
+        borrow::Borrow,
         io::Read,
         net::SocketAddr,
         ops::{Index, IndexMut},
@@ -73,26 +74,34 @@ impl PacketBatch {
         batch
     }
 
-    pub fn new_unpinned_with_recycler_data_and_dests<T: Serialize>(
+    pub fn new_unpinned_with_recycler_data_and_dests<S, T>(
         recycler: &PacketBatchRecycler,
         name: &'static str,
-        dests_and_data: &[(SocketAddr, T)],
-    ) -> Self {
+        dests_and_data: impl IntoIterator<Item = (S, T), IntoIter: ExactSizeIterator>,
+    ) -> Self
+    where
+        S: Borrow<SocketAddr>,
+        T: solana_packet::Encode,
+    {
+        let dests_and_data = dests_and_data.into_iter();
         let mut batch = Self::new_unpinned_with_recycler(recycler, dests_and_data.len(), name);
         batch
             .packets
             .resize(dests_and_data.len(), Packet::default());
 
-        for ((addr, data), packet) in dests_and_data.iter().zip(batch.packets.iter_mut()) {
+        for ((addr, data), packet) in dests_and_data.zip(batch.packets.iter_mut()) {
+            let addr = addr.borrow();
             if !addr.ip().is_unspecified() && addr.port() != 0 {
                 if let Err(e) = Packet::populate_packet(packet, Some(addr), &data) {
                     // TODO: This should never happen. Instead the caller should
                     // break the payload into smaller messages, and here any errors
                     // should be propagated.
                     error!("Couldn't write to packet {:?}. Data skipped.", e);
+                    packet.meta_mut().set_discard(true);
                 }
             } else {
                 trace!("Dropping packet, as destination is unknown");
+                packet.meta_mut().set_discard(true);
             }
         }
         batch
@@ -246,19 +255,15 @@ where
 #[cfg(test)]
 mod tests {
     use {
-        super::*,
-        solana_sdk::{
-            hash::Hash,
-            signature::{Keypair, Signer},
-            system_transaction,
-        },
+        super::*, solana_hash::Hash, solana_keypair::Keypair, solana_signer::Signer,
+        solana_system_transaction::transfer,
     };
 
     #[test]
     fn test_to_packet_batches() {
         let keypair = Keypair::new();
-        let hash = Hash::new(&[1; 32]);
-        let tx = system_transaction::transfer(&keypair, &keypair.pubkey(), 1, hash);
+        let hash = Hash::new_from_array([1; 32]);
+        let tx = transfer(&keypair, &keypair.pubkey(), 1, hash);
         let rv = to_packet_batches_for_tests(&[tx.clone(); 1]);
         assert_eq!(rv.len(), 1);
         assert_eq!(rv[0].len(), 1);
