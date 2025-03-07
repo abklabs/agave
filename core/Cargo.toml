@@ -161,6 +161,8 @@ frozen-abi = [
     "solana-vote/frozen-abi",
     "solana-vote-program/frozen-abi",
 ]
+rocksdb = ["solana-ledger/rocksdb"]
+rocksdb-stub = ["solana-ledger/rocksdb-stub"]
 
 [[bench]]
 name = "banking_stage"

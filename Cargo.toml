@@ -102,6 +102,7 @@ members = [
     "rayon-threadlimit",
     "rbpf-cli",
     "remote-wallet",
+    "rocksdb-stub",
     "rpc",
     "rpc-client",
     "rpc-client-api",
@@ -109,6 +110,7 @@ members = [
     "rpc-test",
     "runtime",
     "runtime-transaction",
+    "sandbox",
     "send-transaction-service",
     "stake-accounts",
     "storage-bigtable",
@@ -329,6 +331,7 @@ reed-solomon-erasure = "6.0.0"
 regex = "1.11.1"
 reqwest = { version = "0.11.27", default-features = false }
 reqwest-middleware = "0.2.5"
+rocksdb-stub = { path = "rocksdb-stub", version = "=0.0.0" }
 rolling-file = "0.2.0"
 rpassword = "7.3"
 rustls = { version = "0.23.23", features = ["std"], default-features = false }

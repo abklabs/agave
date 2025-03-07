@@ -34,6 +34,9 @@ pub mod token_balances;
 mod transaction_address_lookup_table_scanner;
 pub mod use_snapshot_archives_at_startup;
 
+#[cfg(not(feature = "rocksdb"))]
+extern crate rocksdb_stub as rocksdb;
+
 #[macro_use]
 extern crate eager;
 

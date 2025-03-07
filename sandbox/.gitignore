@@ -1,0 +1,4 @@
+/afl-target
+/out/*
+!/out/.gitkeep
+/core.*

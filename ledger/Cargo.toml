@@ -37,6 +37,7 @@ rand = { workspace = true }
 rand_chacha = { workspace = true }
 rayon = { workspace = true }
 reed-solomon-erasure = { workspace = true, features = ["simd-accel"] }
+rocksdb-stub = { workspace = true, optional = true }
 scopeguard = { workspace = true }
 serde = { workspace = true }
 serde_bytes = { workspace = true }
@@ -89,6 +90,7 @@ trees = { workspace = true }
 version = "0.23.0"
 default-features = false
 features = ["lz4"]
+optional = true
 
 [dev-dependencies]
 bs58 = { workspace = true }
@@ -106,6 +108,8 @@ frozen-abi = [
     "dep:solana-frozen-abi-macro",
     "solana-runtime/frozen-abi",
 ]
+rocksdb = ["dep:rocksdb"]
+rocksdb-stub = ["dep:rocksdb-stub"]
 
 [lib]
 crate-type = ["lib"]
